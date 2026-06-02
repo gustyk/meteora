@@ -302,6 +302,63 @@ Then `BEHAVIORAL CORE` (patience, gas efficiency, after-close swap, slippage, Se
 
 ### Backward Compatibility
 
+---
+
+## Risk-Aware Yield Evolution
+
+High-volatility pools need higher fees to justify the additional IL risk. The screening `getTopCandidates()` filter now scales the required `minFeeActiveTvlRatio` by pool volatility:
+
+```
+volScale = min(3.0, 1 + max(0, vol - 1) * 0.2)   // linear ramp, capped at 3x
+effective_min = minFeeActiveTvlRatio × volScale
+```
+
+| Pool volatility | Multiplier | Required fee/active-TVL (base 0.05) |
+|------------------|------------|--------------------------------------|
+| 0 (no data)      | 1.0×       | 0.050 |
+| 1                | 1.0×       | 0.050 |
+| 2                | 1.2×       | 0.060 |
+| 3                | 1.4×       | 0.070 |
+| 4                | 1.6×       | 0.080 |
+| 5 (ceiling)      | 1.8×       | 0.090 |
+| 7                | 2.2×       | 0.110 |
+| 12+              | 3.0× (cap) | 0.150 |
+
+The `compositeScore()` formula also penalizes high-vol pools: `if (vol > 4) score -= min(15, (vol - 4) * 5)` so the LLM sees the risk in the pre-rank.
+
+**Evolve integration**: `evolveThresholds()` now tightens the `maxVolatility` ceiling when losers cluster at high vol. With `MAX_CHANGE_PER_STEP = 0.20`, one step tightens by 20% (5 → 4 → 3.2 → ...). Opt-out by setting `maxVolatility: 99` or `0` in `user-config.json`.
+
+**Executor safety check**: `deploy_position` refuses pools where `volatility > screening.maxVolatility` (default 5.0). Bypass by setting `maxVolatility: 99`.
+
+## Drawdown Guard Force-Exit
+
+`management.drawdownGuardForceExit: true` converts the drawdown guard from a soft hint to a deterministic close. When enabled, the actionMap routes drawdown-guarded positions to `CLOSE` (rule `drawdown_guard_force_exit`) instead of `INSTRUCTION` (LLM eval). Useful for risk-off mode or automated portfolios.
+
+```js
+if (enriched.drawdownGuardFired) {
+  if (config.management.drawdownGuardForceExit === true) {
+    actionMap.set(p.position, { action: "CLOSE", rule: "drawdown_guard_force_exit" });
+    continue;
+  }
+  actionMap.set(p.position, { action: "INSTRUCTION", rule: "drawdown_guard" });
+}
+```
+
+Default: `false` (soft hint to LLM). Toggle in `user-config.json`:
+```json
+"drawdownGuardForceExit": true
+```
+
+## Hindsight Auto-Reflect
+
+Verified wired up in `lessons.js:226-239`:
+- Every `hindsight.autoReflectEvery` closed positions (default 5), `hindsightReflect()` runs on accumulated performance
+- Result is auto-retained to the `meridian_reflections` bank as `type: "reflection"`, `source: "auto"`
+- Reflection query: "What patterns distinguish winning positions from losing ones? Any actionable rules for screening thresholds or position management?"
+- Disabled by setting `hindsightAutoReflectEvery: 0` in user-config or `autoReflectEvery: 0` in code
+
+## Backward Compatibility
+
 All new keys default to previous behavior. Set `management.autoSentinelEnabled: false` to disable auto-Sentinel. Set `management.comparableAltEnabled: false` to disable alt yield. Temperature change is opt-in via `managementTemperature` in `user-config.json`.
 
 ### Smoke Test
@@ -491,7 +548,7 @@ Agent Meridian HiveMind sync is handled by `hivemind.js`. It uses built-in Agent
 
 ## Known Issues / Tech Debt
 
-- `lessons.js evolveThresholds()` evolves `maxVolatility` + `minFeeTvlRatio` (wrong key names — should be `minFeeActiveTvlRatio`; `maxVolatility` doesn't exist in config at all). The evolution is a no-op for those keys.
+- (none — `evolveThresholds` key bug fixed: `minFeeTvlRatio` → `minFeeActiveTvlRatio`; `maxVolatility` added to config + executor safety check)
 - `get_wallet_positions` tool (dlmm.js) is in definitions.js but not in MANAGER_TOOLS or SCREENER_TOOLS — only available in GENERAL role.
 - `runScreener()` self-consistency / tournament / two-stage modes are opt-in. Default behavior unchanged.
 - Conviction enforcement is LOG-ONLY (analytics) — the deploy has already happened by the time we parse the score. The agent is supposed to self-enforce via the MANDATORY PRE-DEPLOY SELF-CHECK section in the prompt.

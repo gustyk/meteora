@@ -346,8 +346,14 @@ export async function runManagementCycle({ silent = false } = {}) {
         actionMap.set(p.position, { action: "STAY" });
         continue;
       }
-      // 4. Drawdown guard (#15) — soft-stop hint for LLM
+      // 4. Drawdown guard (#15) — DETERMINISTIC exit when force-exit enabled
       if (enriched.drawdownGuardFired) {
+        if (config.management.drawdownGuardForceExit === true) {
+          // Skip LLM — risk-off mode. Auto-close the position.
+          actionMap.set(p.position, { action: "CLOSE", rule: "drawdown_guard_force_exit", reason: enriched.drawdownGuardReason });
+          continue;
+        }
+        // Soft-stop hint for LLM
         actionMap.set(p.position, { action: "INSTRUCTION", rule: "drawdown_guard", reason: enriched.drawdownGuardReason });
         continue;
       }

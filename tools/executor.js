@@ -165,12 +165,19 @@ async function validateDeployPoolThresholds(args) {
   }
 
   const volatility = poolDetailVolatility(volatilityDetail);
-  if (volatility == null || volatility <= 0) {
-    return {
-      pass: false,
-      reason: `Pool ${volatilityTimeframe} volatility ${volatility ?? "unknown"} is unusable. Refusing deploy.`,
-    };
-  }
+      if (volatility == null || volatility <= 0) {
+        return {
+          pass: false,
+          reason: `Pool ${volatilityTimeframe} volatility ${volatility ?? "unknown"} is unusable. Refusing deploy.`,
+        };
+      }
+      const maxVolatility = Number(config.screening?.maxVolatility);
+      if (Number.isFinite(maxVolatility) && volatility > maxVolatility) {
+        return {
+          pass: false,
+          reason: `Pool ${volatilityTimeframe} volatility ${volatility} exceeds ceiling ${maxVolatility} (evolved from past losers). Refusing deploy.`,
+        };
+      }
 
   const actualBinStep = poolDetailBinStep(detail);
   const minStep = numberOrNull(config.screening.minBinStep);
@@ -561,6 +568,7 @@ const toolMap = {
     const CONFIG_MAP = {
       // screening
       minFeeActiveTvlRatio: ["screening", "minFeeActiveTvlRatio"],
+      maxVolatility: ["screening", "maxVolatility"],
       excludeHighSupplyConcentration: ["screening", "excludeHighSupplyConcentration"],
       minTvl: ["screening", "minTvl"],
       maxTvl: ["screening", "maxTvl"],

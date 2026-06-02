@@ -81,6 +81,7 @@ export function compositeScore(pool, { smartWalletCount = 0, poolMemorySignals =
   score += Math.min(5, Math.log10(Math.max(1, holders)) * 2);
   if (mcap >= 200_000 && mcap <= 2_000_000) score += 5;
   if (vol >= 1 && vol <= 4) score += 5;
+  if (vol > 4) score -= Math.min(15, (vol - 4) * 5); // vol 5 → -5, vol 7 → -15, etc.
 
   // Risk penalties
   if (top10 > 60) score -= 10;
@@ -626,9 +627,23 @@ export async function getTopCandidates({ limit = 10 } = {}) {
         return false;
       }
       const feeActiveTvlRatio = Number(p.fee_active_tvl_ratio);
-      if (Number.isFinite(minFeeActiveTvlRatio) && minFeeActiveTvlRatio > 0 && (!Number.isFinite(feeActiveTvlRatio) || feeActiveTvlRatio < minFeeActiveTvlRatio)) {
-        pushFilteredReason(filteredOut, p, `fee/active-TVL ${Number.isFinite(feeActiveTvlRatio) ? feeActiveTvlRatio : "unknown"} below minFeeActiveTvlRatio ${minFeeActiveTvlRatio}`);
-        return false;
+      if (Number.isFinite(minFeeActiveTvlRatio) && minFeeActiveTvlRatio > 0) {
+        // Risk-aware yield: scale required fee/active-TVL by pool volatility.
+        // High-vol pools need higher fees to justify the risk. Linear ramp:
+        //   vol <= 1 → 1.0x  (baseline)
+        //   vol = 2  → 1.2x
+        //   vol = 3  → 1.4x
+        //   vol = 5  → 1.8x
+        // Capped at 3.0x to avoid absurd rejections on extreme volatility.
+        const vol = Number(p.volatility);
+        const volScale = Number.isFinite(vol) && vol > 0
+          ? Math.min(3.0, 1 + Math.max(0, vol - 1) * 0.2)
+          : 1.0;
+        const effectiveMin = Number((minFeeActiveTvlRatio * volScale).toFixed(4));
+        if (!Number.isFinite(feeActiveTvlRatio) || feeActiveTvlRatio < effectiveMin) {
+          pushFilteredReason(filteredOut, p, `fee/active-TVL ${Number.isFinite(feeActiveTvlRatio) ? feeActiveTvlRatio : "unknown"} below effective min ${effectiveMin} (vol=${vol ?? "n/a"} × ${volScale.toFixed(2)} scale)`);
+          return false;
+        }
       }
       if (!isUsableVolatility(p.volatility)) {
         pushFilteredReason(filteredOut, p, `volatility ${p.volatility ?? "unknown"} is unusable`);
