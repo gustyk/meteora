@@ -200,13 +200,13 @@ export const config = {
   // Hindsight runs as a separate Docker container (see docker-compose.yml).
   // npm client: @vectorize-io/hindsight-client
   hindsight: {
-    enabled:           u.hindsightEnabled          ?? (process.env.HINDSIGHT_ENABLED === "true"),
+    enabled:           u.hindsightEnabled          ?? (process.env.HINDSIGHT_ENABLED !== "false"),
     baseUrl:           nonEmptyString(u.hindsightUrl, process.env.HINDSIGHT_URL) || "http://localhost:8888",
     bankPrefix:        nonEmptyString(u.hindsightBankPrefix, process.env.HINDSIGHT_BANK_PREFIX) || "meridian",
-    autoRecall:        u.hindsightAutoRecall        ?? false, // inject recall() results into system prompt
-    autoReflectEvery:  u.hindsightAutoReflectEvery  ?? 5,    // reflect on performance every N closes (0 = disable)
-    recallLimit:       u.hindsightRecallLimit       ?? 6,    // max items to inject per agent run
-    recallMaxChars:    u.hindsightRecallMaxChars    ?? 1800, // cap on injected block size
+    autoRecall:        u.hindsightAutoRecall        ?? true,  // inject recall() results into system prompt
+    autoReflectEvery:  u.hindsightAutoReflectEvery  ?? 5,     // reflect on performance every N closes (0 = disable)
+    recallLimit:       u.hindsightRecallLimit       ?? 6,     // max items to inject per agent run
+    recallMaxChars:    u.hindsightRecallMaxChars    ?? 1800,  // cap on injected block size
   },
 
   indicators: {

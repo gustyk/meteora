@@ -25,6 +25,12 @@
  */
 
 import { log } from "./logger.js";
+import { spawn } from "child_process";
+import { existsSync } from "fs";
+import { fileURLToPath } from "url";
+import path from "path";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const DEFAULT_BASE_URL = "http://localhost:8888";
 const DEFAULT_BANK_PREFIX = "meridian";
@@ -126,6 +132,126 @@ export async function ping() {
   _healthCheckedAt = 0;
   await init();
   return _available;
+}
+
+// ─── Bootstrap: ensure Hindsight is running at agent startup ──────
+
+const COMPOSE_PATH = path.join(__dirname, "docker-compose.yml");
+const STARTUP_GRACE_MS = 25_000;
+const STARTUP_PROBE_INTERVAL_MS = 1_500;
+
+function tryDockerComposeUp(timeoutMs) {
+  return new Promise((resolve) => {
+    if (!existsSync(COMPOSE_PATH)) {
+      resolve({ started: false, reason: "no docker-compose.yml" });
+      return;
+    }
+    let stdout = "";
+    let stderr = "";
+    let killed = false;
+    const child = spawn("docker", ["compose", "-f", COMPOSE_PATH, "up", "-d", "hindsight"], {
+      cwd: __dirname,
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    });
+    const timer = setTimeout(() => {
+      killed = true;
+      child.kill("SIGTERM");
+      resolve({ started: false, reason: `docker compose timed out after ${timeoutMs}ms` });
+    }, timeoutMs);
+
+    child.stdout.on("data", (d) => { stdout += d.toString(); });
+    child.stderr.on("data", (d) => { stderr += d.toString(); });
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      if (!killed) resolve({ started: false, reason: `docker not available: ${err.message}` });
+    });
+    child.on("exit", (code) => {
+      clearTimeout(timer);
+      if (killed) return;
+      if (code === 0) {
+        resolve({ started: true, stdout: stdout.trim() });
+      } else {
+        resolve({ started: false, reason: `docker compose exited ${code}: ${stderr.trim().slice(0, 300)}` });
+      }
+    });
+  });
+}
+
+async function waitForHealthy(maxMs) {
+  const deadline = Date.now() + maxMs;
+  while (Date.now() < deadline) {
+    _healthCheckedAt = 0; // force a fresh probe
+    await init();
+    if (_available) return true;
+    await new Promise((r) => setTimeout(r, STARTUP_PROBE_INTERVAL_MS));
+  }
+  return false;
+}
+
+/**
+ * Auto-bootstrap: called at agent startup.
+ *
+ * - If Hindsight is already reachable, no-op.
+ * - If URL is the default localhost:8888, attempt to bring up the
+ *   Docker container defined in docker-compose.yml.
+ * - Otherwise, just probe and log; assume the user manages the
+ *   service externally.
+ *
+ * Best-effort: never throws. Always returns a status the caller can log.
+ */
+export async function bootstrap({ timeoutMs = STARTUP_GRACE_MS } = {}) {
+  const cfg = await getHindsightConfig();
+  const result = {
+    enabled: !!cfg.enabled,
+    started: false,
+    reachable: false,
+    skipped: null,
+    error: null,
+  };
+
+  if (!cfg.enabled) {
+    result.skipped = "disabled in config";
+    return result;
+  }
+
+  // 1. Probe first
+  _healthCheckedAt = 0;
+  await init();
+  if (_available) {
+    result.reachable = true;
+    return result;
+  }
+
+  const baseUrl = (cfg.baseUrl || process.env.HINDSIGHT_URL || DEFAULT_BASE_URL).replace(/\/+$/, "");
+  const isLocal = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i.test(baseUrl);
+
+  if (!isLocal) {
+    result.skipped = `HINDSIGHT_URL=${baseUrl} is non-local; start the service externally.`;
+    return result;
+  }
+
+  // 2. Try to bring it up via docker compose
+  log("hindsight", `Hindsight unreachable at ${baseUrl} — attempting docker compose up -d`);
+  const composeResult = await tryDockerComposeUp(Math.min(15_000, timeoutMs));
+  if (!composeResult.started) {
+    result.error = composeResult.reason;
+    log("hindsight_warn", `docker compose up failed: ${composeResult.reason} — agent will keep using local JSON files`);
+    return result;
+  }
+  result.started = true;
+  log("hindsight", "docker compose up -d succeeded; waiting for healthy…");
+
+  // 3. Wait for the service to come up
+  const healthy = await waitForHealthy(Math.max(0, timeoutMs - 15_000));
+  result.reachable = healthy;
+  if (!healthy) {
+    result.error = `Hindsight container started but did not become healthy within ${timeoutMs}ms`;
+    log("hindsight_warn", result.error);
+  } else {
+    log("hindsight", "Hindsight is healthy — memory layer active");
+  }
+  return result;
 }
 
 // ─── Core operations ─────────────────────────────────────────────

@@ -33,6 +33,7 @@ import { getTokenNarrative, getTokenInfo } from "./tools/token.js";
 import { stageSignals } from "./signal-tracker.js";
 import { getWeightsSummary } from "./signal-weights.js";
 import { bootstrapHiveMind, ensureAgentId, getHiveMindPullMode, isHiveMindEnabled, pullHiveMindLessons, pullHiveMindPresets, registerHiveMindAgent, startHiveMindBackgroundSync } from "./hivemind.js";
+import { bootstrap as bootstrapHindsight } from "./hindsight.js";
 import { appendDecision } from "./decision-log.js";
 
 const entrypointPath = process.env.pm_exec_path || process.argv[1];
@@ -47,6 +48,27 @@ if (isMain) {
   ensureAgentId();
   bootstrapHiveMind().catch((error) => log("hivemind_warn", `Bootstrap failed: ${error.message}`));
   startHiveMindBackgroundSync();
+
+  // Auto-activate Hindsight alongside auto-trading. Fire-and-forget:
+  // never blocks the cron loops if Docker is slow or unavailable.
+  if (config.hindsight?.enabled) {
+    log("startup", "Hindsight: enabled — auto-starting alongside trading cycles");
+    bootstrapHindsight()
+      .then((status) => {
+        if (status.reachable) {
+          log("startup", "Hindsight: ready (memory layer active)");
+        } else if (status.started) {
+          log("hindsight_warn", `Hindsight: started but unhealthy — ${status.error}`);
+        } else if (status.skipped) {
+          log("hindsight", `Hindsight: ${status.skipped}`);
+        } else if (status.error) {
+          log("hindsight_warn", `Hindsight: ${status.error}`);
+        }
+      })
+      .catch((error) => log("hindsight_warn", `Bootstrap crashed: ${error.message}`));
+  } else {
+    log("startup", "Hindsight: disabled (set hindsightEnabled: true in user-config to activate)");
+  }
 }
 
 const TP_PCT = config.management.takeProfitPct;

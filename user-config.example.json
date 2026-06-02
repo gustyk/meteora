@@ -103,10 +103,10 @@
   "hiveMindApiKey": "",
   "hiveMindPullMode": "auto",
 
-  "hindsightEnabled": false,
+  "hindsightEnabled": true,
   "hindsightUrl": "http://localhost:8888",
   "hindsightBankPrefix": "meridian",
-  "hindsightAutoRecall": false,
+  "hindsightAutoRecall": true,
   "hindsightAutoReflectEvery": 5,
   "hindsightRecallLimit": 6,
   "hindsightRecallMaxChars": 1800
