@@ -259,6 +259,46 @@ Agent Meridian HiveMind sync is handled by `hivemind.js`. It uses built-in Agent
 
 ---
 
+## DLMM Sentinel Skill (Impermanent Loss Mitigation)
+
+`tools/sentinel.js` implements a 4-module skill for active IL management on Meteora DLMM:
+
+1. **SENSING** — `fetchPositionState()` pulls live `active_bin`, `position_pnl`, and on-chain state.
+2. **ANTICIPATION** — `classifyRegime()` (LOW_VOL_SIDEWAYS / HIGH_VOL_TRENDING / MEAN_REVERTING) and `calculateBinExitProbability()` (normal-distribution P_exit over Δt).
+3. **MITIGATION** — `recommendAction()` produces one of: `REBALANCE_SHAPE`, `TIGHTEN_SHAPE`, `ASYMMETRIC_LADDER`, `HEDGE_DELTA`, `EMERGENCY_WITHDRAW`, `HOLD`. Respects a cooldown gate (default 300s).
+4. **LEARNING** — `calculateReward()` implements R_t = α·F − β·ΔIL − γ·C − λ·P. Records every evaluation to `sentinel-state.json` and retains to Hindsight (fail-safe).
+
+**Regime → shape mapping:**
+| Regime | Shape | Rationale |
+|--------|-------|-----------|
+| `LOW_VOL_SIDEWAYS` | `bid_ask` | Concentrate tightly to harvest dynamic fees |
+| `HIGH_VOL_TRENDING` | `curve` | Spread horizontally, slow IL |
+| `MEAN_REVERTING` | `spot` (asymmetric) | Laddered TP or buy-the-dip |
+| `EMERGENCY` (`|IL|≥15%`) | `withdraw` | Full exit to stable |
+
+**Tools exposed to the LLM** (in `tools/definitions.js`):
+- `sentinel_analyze` — full 4-module evaluation (SENSING → ANTICIPATION → MITIGATION → LEARNING)
+- `sentinel_calculate_reward` — R_t calculator
+- `sentinel_classify_regime` — regime classifier
+- `sentinel_calculate_p_exit` — bin-exit probability
+- `sentinel_calculate_il` — AMM IL
+- `sentinel_get_status` — view weights + recent reward history
+- `sentinel_set_weights` — tune α,β,γ,λ at runtime
+- `sentinel_set_thresholds` — tune P_exit / IL / regime cutoffs
+- `sentinel_evaluate_closed` — post-mortem reward capture (called from `lessons.js` on close)
+
+**Auto-wiring:**
+- `agent.js` exposes all Sentinel tools to `MANAGER_TOOLS` and to the `close` / `claim` / `sentinel` GENERAL intents
+- `prompt.js` MANAGER section injects a 1-line reminder ("DLMM SENTINEL: call before any non-trivial action…")
+- `lessons.js → recordPerformance()` calls `evaluateClosedPosition()` to feed the closed outcome into the reward signal
+- `strategy-library.js` ships a `dlmm_sentinel` meta-strategy that documents the regime → shape contract
+- Every Sentinel evaluation is auto-retained to Hindsight's pools bank (fail-safe)
+
+**Configuration** (`config.sentinel`, overridable in `user-config.json`):
+- `weights.{alpha,beta,gamma,lambda}` — R_t coefficients. β is the IL penalty, default 2.0 (highest).
+- `thresholds.{pExitLow, pExitHigh, ilPctHedge, ilPctEmergency, volHighThreshold, trendStrongThreshold, meanReversionThreshold}`
+- `control.{rebalanceCooldownSec, maxSlippagePct, hedgingSizePct}` — defaults match the spec: 300s cooldown, 0.3% max slippage, 50% delta-hedge sizing at 2% IL
+
 ## Known Issues / Tech Debt
 
 - `lessons.js evolveThresholds()` evolves `maxVolatility` + `minFeeTvlRatio` (wrong key names — should be `minFeeActiveTvlRatio`; `maxVolatility` doesn't exist in config at all). The evolution is a no-op for those keys.

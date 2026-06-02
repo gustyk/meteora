@@ -1209,6 +1209,195 @@ Hindsight will internally extract entities, relationships, and temporal data fro
       }
     }
   },
+
+  // ─── DLMM Sentinel tools (Impermanent Loss mitigation) ───────────
+  // 4-module skill: SENSING → ANTICIPATION → MITIGATION → LEARNING.
+  // Reward signal: R_t = α·F − β·ΔIL − γ·C − λ·P. Tunable via sentinel_set_weights.
+  {
+    type: "function",
+    function: {
+      name: "sentinel_analyze",
+      description: `Run a full DLMM Sentinel evaluation on a position. The 4-module pipeline:
+1) SENSING: fetches active bin, live PnL, and current on-chain state.
+2) ANTICIPATION: classifies market regime (LOW_VOL_SIDEWAYS / HIGH_VOL_TRENDING / MEAN_REVERTING) and estimates P_exit (bin-exit probability).
+3) MITIGATION: recommends a concrete action — REBALANCE_SHAPE, TIGHTEN_SHAPE, ASYMMETRIC_LADDER, HEDGE_DELTA, EMERGENCY_WITHDRAW, or HOLD. Includes cooldown check and IL emergency override.
+4) LEARNING: calculates the reward signal R_t = α·F − β·ΔIL − γ·C − λ·P and records the evaluation to the Sentinel log (and to Hindsight if enabled).
+
+Use this BEFORE any non-trivial management action. The recommendation + cooldown status + IL number should drive your close/claim/rebalance decision.
+
+Returns: { regime, pExit, ilPct, reward, recommendation: { action, reason, targetShape, cooldownOk, ... } }`,
+      parameters: {
+        type: "object",
+        properties: {
+          position: {
+            type: "object",
+            description: "Position descriptor. Must include pool_address; should include position_address, bin range, initial_price, strategy.",
+            properties: {
+              position_address: { type: "string" },
+              pool_address:    { type: "string" },
+              strategy:        { type: "string" },
+              lower_bin_id:    { type: "number" },
+              upper_bin_id:    { type: "number" },
+              initial_price:   { type: "number" },
+              bin_step:        { type: "number" },
+              last_sentinel_eval: { type: "string", description: "ISO timestamp of last Sentinel evaluation for cooldown" },
+            },
+            required: ["pool_address"]
+          },
+          volatility:    { type: "number", description: "Current pool volatility (positive number). Omit to use 1.0 fallback." },
+          trend:         { type: "number", description: "Recent price trend, -1..1. Default 0." },
+          mean_reversion:{ type: "number", description: "Mean-reversion strength, 0..1. Default 0." },
+          fees:          { type: "number", description: "Fees earned in this interval (for reward signal). Default 0." },
+          gas_cost:      { type: "number", description: "Gas + slippage cost (for reward signal). Default 0." },
+          oor_penalty:   { type: "number", description: "0 or 1 — was position OOR? Default 0." }
+        },
+        required: ["position"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "sentinel_calculate_reward",
+      description: `Compute the Sentinel reward signal R_t = α·F − β·ΔIL − γ·C − λ·P.
+
+Components:
+- F: fees earned in the interval
+- ΔIL: change in impermanent loss (absolute value used)
+- C: gas + slippage cost
+- P: 0 or 1 (OOR penalty)
+
+Weights α,β,γ,λ default from config.sentinel.weights. β is typically the highest (IL minimization is the primary objective).`,
+      parameters: {
+        type: "object",
+        properties: {
+          fees:       { type: "number", description: "Fees earned." },
+          delta_il:   { type: "number", description: "Change in impermanent loss (signed)." },
+          gas_cost:   { type: "number", description: "Gas + slippage cost." },
+          oor_penalty:{ type: "number", description: "0 or 1 — was position OOR?" },
+          weights: {
+            type: "object",
+            description: "Optional override for α,β,γ,λ.",
+            properties: {
+              alpha:  { type: "number" },
+              beta:   { type: "number" },
+              gamma:  { type: "number" },
+              lambda: { type: "number" },
+            }
+          }
+        }
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "sentinel_classify_regime",
+      description: "Classify the current market regime from observable signals. Returns one of: LOW_VOL_SIDEWAYS, HIGH_VOL_TRENDING, MEAN_REVERTING.",
+      parameters: {
+        type: "object",
+        properties: {
+          volatility:     { type: "number", description: "Current volatility (positive)." },
+          trend:          { type: "number", description: "Recent price trend, -1..1." },
+          mean_reversion: { type: "number", description: "Mean-reversion strength, 0..1." }
+        },
+        required: ["volatility"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "sentinel_calculate_p_exit",
+      description: "Estimate the probability that price exits the current bin range within the next Δt minutes (default 5). Uses a normal-distribution model: P(|z| > minDist/σ).",
+      parameters: {
+        type: "object",
+        properties: {
+          active_bin_id: { type: "number", description: "Current active bin id." },
+          lower_bin_id:  { type: "number", description: "Position's lower bin id." },
+          upper_bin_id:  { type: "number", description: "Position's upper bin id." },
+          volatility:    { type: "number", description: "Current volatility (positive)." },
+          bin_step:      { type: "number", description: "Pool bin step in bps. Default 100." },
+          dt_min:        { type: "number", description: "Time horizon in minutes. Default 5." }
+        },
+        required: ["active_bin_id", "lower_bin_id", "upper_bin_id", "volatility"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "sentinel_calculate_il",
+      description: "Standard AMM impermanent loss for a given price ratio. price_ratio = current_price / initial_price. Returns IL (decimal) and il_pct (percentage).",
+      parameters: {
+        type: "object",
+        properties: {
+          price_ratio: { type: "number", description: "current_price / initial_price. e.g. 1.5 for +50% move." }
+        },
+        required: ["price_ratio"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "sentinel_get_status",
+      description: "View current Sentinel configuration (weights, thresholds, control params) and recent reward history.",
+      parameters: { type: "object", properties: {} }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "sentinel_set_weights",
+      description: `Tune the reward function weights α,β,γ,λ at runtime. β controls IL penalty and is typically the highest. Persists in memory (process lifetime; not yet persisted to user-config.json).`,
+      parameters: {
+        type: "object",
+        properties: {
+          alpha:  { type: "number", description: "Fee weight (positive)." },
+          beta:   { type: "number", description: "IL penalty weight (typically highest)." },
+          gamma:  { type: "number", description: "Gas/slippage cost weight." },
+          lambda: { type: "number", description: "OOR penalty weight." }
+        }
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "sentinel_set_thresholds",
+      description: `Tune Sentinel thresholds: p_exit boundaries, IL hedging/emergency triggers, volatility regime cutoffs. All keys are optional.`,
+      parameters: {
+        type: "object",
+        properties: {
+          p_exit_low:           { type: "number", description: "Lower P_exit boundary for tight regime. Default 0.15." },
+          p_exit_high:          { type: "number", description: "Upper P_exit boundary for high-vol regime. Default 0.60." },
+          il_pct_hedge:         { type: "number", description: "IL % that triggers HEDGE_DELTA. Default 2.0." },
+          il_pct_emergency:     { type: "number", description: "IL % that triggers EMERGENCY_WITHDRAW. Default 15.0." },
+          vol_high_threshold:   { type: "number", description: "Volatility cutoff for HIGH_VOL regime. Default 3.5." },
+          trend_strong_threshold:{ type: "number", description: "|trend| cutoff for HIGH_VOL_TRENDING. Default 0.4." },
+          mean_reversion_threshold:{ type: "number", description: "Mean-reversion cutoff. Default 0.6." }
+        }
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "sentinel_evaluate_closed",
+      description: `Post-mortem reward calculation for a closed position. Records the result to the Sentinel log for future learning. Use after close_position to capture the lesson.`,
+      parameters: {
+        type: "object",
+        properties: {
+          fees:        { type: "number", description: "Total fees earned by the position." },
+          delta_il:    { type: "number", description: "Net change in IL (signed; +ve = worse than hold)." },
+          gas_cost:    { type: "number", description: "Cumulative gas + slippage across rebalances." },
+          oor_penalty: { type: "number", description: "0 or 1 — was the position OOR at any point?" }
+        },
+        required: ["fees", "delta_il"]
+      }
+    }
+  },
 ];
 
 export const tools = toolDefinitions.map((tool) => ({

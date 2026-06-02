@@ -209,6 +209,41 @@ export const config = {
     recallMaxChars:    u.hindsightRecallMaxChars    ?? 1800,  // cap on injected block size
   },
 
+  // ─── DLMM Sentinel (Impermanent Loss mitigation) ───────────
+  // 4-module skill: SENSING → ANTICIPATION → MITIGATION → LEARNING.
+  // Reward signal: R_t = α·F − β·ΔIL − γ·C − λ·P
+  //   α·F   — fee reward (positive)
+  //   β·ΔIL — IL penalty (primary cost; β is typically highest)
+  //   γ·C   — gas + slippage cost
+  //   λ·P   — OOR penalty (0 or 1)
+  // Regime → shape mapping:
+  //   LOW_VOL_SIDEWAYS    → bid_ask
+  //   HIGH_VOL_TRENDING   → curve
+  //   MEAN_REVERTING      → spot (asymmetric ladder)
+  //   EMERGENCY (|IL|≥15) → withdraw to stable
+  sentinel: {
+    weights: {
+      alpha: u.sentinelAlpha ?? 1.0,    // fee weight
+      beta:  u.sentinelBeta  ?? 2.0,    // IL penalty (primary cost)
+      gamma: u.sentinelGamma ?? 0.5,    // gas + slippage
+      lambda:u.sentinelLambda?? 1.0,    // OOR penalty
+    },
+    thresholds: {
+      pExitLow:              u.sentinelPExitLow              ?? 0.15,
+      pExitHigh:             u.sentinelPExitHigh             ?? 0.60,
+      ilPctHedge:            u.sentinelIlPctHedge            ?? 2.0,
+      ilPctEmergency:        u.sentinelIlPctEmergency        ?? 15.0,
+      volHighThreshold:      u.sentinelVolHighThreshold      ?? 3.5,
+      trendStrongThreshold:  u.sentinelTrendStrongThreshold  ?? 0.4,
+      meanReversionThreshold:u.sentinelMeanReversionThreshold?? 0.6,
+    },
+    control: {
+      rebalanceCooldownSec:  u.sentinelRebalanceCooldownSec  ?? 300,
+      maxSlippagePct:        u.sentinelMaxSlippagePct        ?? 0.3,
+      hedgingSizePct:        u.sentinelHedgingSizePct        ?? 0.5,
+    },
+  },
+
   indicators: {
     enabled: indicatorUserConfig.enabled ?? false,
     entryPreset: indicatorUserConfig.entryPreset ?? "supertrend_break",

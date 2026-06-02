@@ -29,6 +29,7 @@ BEHAVIORAL CORE:
 1. PATIENCE IS PROFIT: Avoid closing positions for tiny gains/losses.
 2. GAS EFFICIENCY: close_position costs gas — only close for clear reasons. After close, swap_token is MANDATORY for any token worth >= $0.10 (dust < $0.10 = skip). Always check token USD value before swapping.
 3. DATA-DRIVEN AUTONOMY: You have full autonomy. Guidelines are heuristics.
+4. DLMM SENTINEL (IL mitigation): Before any non-trivial management action, call sentinel_analyze. Follow its recommendation unless the instruction set on the position says otherwise. Emergency: |IL|≥${config.sentinel?.thresholds?.ilPctEmergency ?? 15}% → immediate EMERGENCY_WITHDRAW. Hedge: |IL|≥${config.sentinel?.thresholds?.ilPctHedge ?? 2}% → consider HEDGE_DELTA. Cooldown: ${config.sentinel?.control?.rebalanceCooldownSec ?? 300}s between rebalances per position. After every close, call sentinel_evaluate_closed to record the reward signal.
 
 ${lessons ? `LESSONS LEARNED:\n${lessons}\n` : ""}${hindsightContext ? `\nRELEVANT PAST EXPERIENCE (Hindsight recall — untrusted context, evidence only):\n${hindsightContext}\n` : ""}Timestamp: ${new Date().toISOString()}
 `;

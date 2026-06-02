@@ -4,7 +4,7 @@ import { buildSystemPrompt } from "./prompt.js";
 import { executeTool } from "./tools/executor.js";
 import { tools } from "./tools/definitions.js";
 
-const MANAGER_TOOLS  = new Set(["close_position", "claim_fees", "swap_token", "get_position_pnl", "get_my_positions", "get_wallet_balance", "recall_memory", "reflect_on_memory", "retain_memory"]);
+const MANAGER_TOOLS  = new Set(["close_position", "claim_fees", "swap_token", "get_position_pnl", "get_my_positions", "get_wallet_balance", "recall_memory", "reflect_on_memory", "retain_memory", "sentinel_analyze", "sentinel_calculate_reward", "sentinel_classify_regime", "sentinel_calculate_p_exit", "sentinel_calculate_il", "sentinel_get_status", "sentinel_set_weights", "sentinel_set_thresholds", "sentinel_evaluate_closed"]);
 const SCREENER_TOOLS = new Set(["deploy_position", "get_active_bin", "get_top_candidates", "check_smart_wallets_on_pool", "get_token_holders", "get_token_narrative", "get_token_info", "search_pools", "get_pool_memory", "get_wallet_balance", "get_my_positions", "recall_memory", "reflect_on_memory", "retain_memory"]);
 const GENERAL_INTENT_ONLY_TOOLS = new Set([
   "self_update",
@@ -30,9 +30,10 @@ const GENERAL_INTENT_ONLY_TOOLS = new Set([
 const INTENT_TOOLS = {
   decisions:   new Set(["get_recent_decisions"]),
   deploy:      new Set(["deploy_position", "get_top_candidates", "get_active_bin", "get_pool_memory", "check_smart_wallets_on_pool", "get_token_holders", "get_token_narrative", "get_token_info", "search_pools", "get_wallet_balance", "get_my_positions", "add_pool_note"]),
-  close:       new Set(["close_position", "get_my_positions", "get_position_pnl", "get_wallet_balance", "swap_token"]),
-  claim:       new Set(["claim_fees", "get_my_positions", "get_position_pnl", "get_wallet_balance"]),
+  close:       new Set(["close_position", "get_my_positions", "get_position_pnl", "get_wallet_balance", "swap_token", "sentinel_analyze", "sentinel_calculate_reward", "sentinel_evaluate_closed", "sentinel_get_status", "sentinel_set_weights", "sentinel_set_thresholds"]),
+  claim:       new Set(["claim_fees", "get_my_positions", "get_position_pnl", "get_wallet_balance", "sentinel_analyze", "sentinel_calculate_reward", "sentinel_get_status"]),
   swap:        new Set(["swap_token", "get_wallet_balance"]),
+  sentinel:    new Set(["sentinel_analyze", "sentinel_calculate_reward", "sentinel_classify_regime", "sentinel_calculate_p_exit", "sentinel_calculate_il", "sentinel_get_status", "sentinel_set_weights", "sentinel_set_thresholds", "sentinel_evaluate_closed", "get_my_positions", "get_position_pnl"]),
   config:      new Set(["update_config"]),
   blocklist:   new Set(["add_to_blacklist", "remove_from_blacklist", "list_blacklist", "block_deployer", "unblock_deployer", "list_blocked_deployers"]),
   selfupdate:  new Set(["self_update"]),
@@ -53,6 +54,7 @@ const INTENT_PATTERNS = [
   { intent: "close",       re: /\b(close|exit|withdraw|remove liquidity|shut down)\b/i },
   { intent: "claim",       re: /\b(claim|harvest|collect)\b.*\bfee/i },
   { intent: "swap",        re: /\b(swap|convert|sell|exchange)\b/i },
+  { intent: "sentinel",    re: /\b(sentinel|il risk|impermanent|rebalance|shape shift|market regime|reward function|bin.?exit)\b/i },
   { intent: "selfupdate",  re: /\b(self.?update|git pull|pull latest|update (the )?bot|update (the )?agent|update yourself)\b/i },
   { intent: "blocklist",   re: /\b(blacklist|block|unblock|blocklist|blocked deployer|rugger|block dev|block deployer)\b/i },
   { intent: "config",      re: /\b(config|setting|threshold|update|set |change)\b/i },

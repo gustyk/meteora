@@ -30,6 +30,17 @@ import {
   reflect as hindsightReflect,
   formatRecallResults,
 } from "../hindsight.js";
+import {
+  runSentinelEvaluation,
+  calculateReward,
+  getSentinelStatus,
+  setSentinelWeights,
+  setSentinelThresholds,
+  evaluateClosedPosition,
+  classifyRegime,
+  calculateBinExitProbability,
+  calculateIL,
+} from "./sentinel.js";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -355,6 +366,68 @@ const toolMap = {
       timestamp: new Date().toISOString(),
     });
     return { available: true, retained: result != null, bank: bankId };
+  },
+
+  // ─── DLMM Sentinel tools (Impermanent Loss mitigation) ─────────
+  // Implements the 4-module architecture: SENSING → ANTICIPATION → MITIGATION → LEARNING.
+  // Reward function: R_t = α·F − β·ΔIL − γ·C − λ·P. Hyperparameters in config.sentinel.
+  sentinel_analyze: async (args) => {
+    const result = await runSentinelEvaluation(args || {});
+    return { success: true, ...result };
+  },
+  sentinel_calculate_reward: ({ fees, delta_il, gas_cost, oor_penalty, weights } = {}) => {
+    const reward = calculateReward({
+      fees: Number(fees) || 0,
+      deltaIL: Number(delta_il) || 0,
+      gasCost: Number(gas_cost) || 0,
+      oorPenalty: Number(oor_penalty) || 0,
+      weights: weights || null,
+    });
+    return { success: true, ...reward };
+  },
+  sentinel_classify_regime: ({ volatility, trend, mean_reversion } = {}) => {
+    const regime = classifyRegime(Number(volatility) || 0, Number(trend) || 0, Number(mean_reversion) || 0);
+    return { success: true, regime };
+  },
+  sentinel_calculate_p_exit: ({ active_bin_id, lower_bin_id, upper_bin_id, volatility, bin_step, dt_min } = {}) => {
+    const pExit = calculateBinExitProbability({
+      activeBinId: Number(active_bin_id),
+      lowerBinId: Number(lower_bin_id),
+      upperBinId: Number(upper_bin_id),
+      volatility: Number(volatility) || 0,
+      binStep: Number(bin_step) || 100,
+      dtMin: Number(dt_min) || 5,
+    });
+    return { success: true, p_exit: Number(pExit.toFixed(4)) };
+  },
+  sentinel_calculate_il: ({ price_ratio } = {}) => {
+    const il = calculateIL(Number(price_ratio) || 1);
+    return { success: true, il: Number(il.toFixed(6)), il_pct: Number((il * 100).toFixed(4)) };
+  },
+  sentinel_get_status: () => ({ success: true, ...getSentinelStatus() }),
+  sentinel_set_weights: ({ alpha, beta, gamma, lambda }) => {
+    const weights = {};
+    if (alpha != null) weights.alpha = Number(alpha);
+    if (beta != null)  weights.beta  = Number(beta);
+    if (gamma != null) weights.gamma = Number(gamma);
+    if (lambda != null) weights.lambda = Number(lambda);
+    return { success: true, ...setSentinelWeights(weights) };
+  },
+  sentinel_set_thresholds: (thresholds = {}) => {
+    const cleaned = {};
+    for (const [k, v] of Object.entries(thresholds)) {
+      if (v != null) cleaned[k] = Number(v);
+    }
+    return { success: true, ...setSentinelThresholds(cleaned) };
+  },
+  sentinel_evaluate_closed: ({ fees, delta_il, gas_cost, oor_penalty } = {}) => {
+    const result = evaluateClosedPosition({
+      fees: Number(fees) || 0,
+      deltaIL: Number(delta_il) || 0,
+      gasCost: Number(gas_cost) || 0,
+      oorPenalty: Number(oor_penalty) || 0,
+    });
+    return { success: true, ...result };
   },
   list_blacklist: listBlacklist,
   block_deployer: blockDev,

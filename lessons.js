@@ -16,6 +16,7 @@ import {
   retainLesson as hindsightRetainLesson,
   reflectOnPerformance as hindsightReflect,
 } from "./hindsight.js";
+import { evaluateClosedPosition } from "./tools/sentinel.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const USER_CONFIG_PATH = path.join(__dirname, "user-config.json");
@@ -165,6 +166,19 @@ export async function recordPerformance(perf) {
   // Fire-and-forget — never blocks the close path.
   if (hindsightAvailable()) {
     void hindsightRetainLesson(lesson, entry);
+  }
+
+  // DLMM Sentinel: feed the closed-position outcome into the reward signal.
+  // Negative PnL% (in dollars) is treated as |ΔIL| proxy; fees are positive.
+  try {
+    evaluateClosedPosition({
+      fees: perf.fees_earned_usd ?? 0,
+      deltaIL: -((entry.pnl_usd ?? 0) - (perf.fees_earned_usd ?? 0)), // IL = price drift, fees offset
+      gasCost: perf.gas_cost_usd ?? 0,
+      oorPenalty: String(perf.close_reason || "").toLowerCase().match(/oor|out.?of.?range/) ? 1 : 0,
+    });
+  } catch (error) {
+    log("sentinel_warn", `Closed-position eval failed: ${error.message}`);
   }
 
   // Update pool-level memory

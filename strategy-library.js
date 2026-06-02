@@ -93,6 +93,27 @@ const DEFAULT_STRATEGIES = {
     exit: { take_profit_pct: 10, notes: "When total return >= 10% of deployed capital: withdraw_liquidity(bps=5000) to take 50% off. Remaining 50% keeps running. Repeat at next threshold." },
     best_for: "Locking in profits without fully exiting winning positions",
   },
+  dlmm_sentinel: {
+    id: "dlmm_sentinel",
+    name: "DLMM Sentinel",
+    author: "meridian-sentinel",
+    lp_strategy: "dynamic",
+    token_criteria: {
+      notes: "Dynamic meta-strategy — picks shape per regime. Best applied to mid-to-high-cap tokens with reliable price feeds and at least 24h of history.",
+    },
+    entry: {
+      condition: "Screener passes + Sentinel analyze pre-flight returns a non-EMERGENCY recommendation and P_exit < 0.60.",
+      notes: "Initial shape is determined by the regime at deploy time. Re-evaluate every management cycle.",
+    },
+    range: {
+      type: "dynamic",
+      notes: "Range auto-adjusts via sentinel_analyze: tightens under LOW_VOL_SIDEWAYS (factor 0.7), widens under HIGH_VOL_TRENDING (factor 1.5), asymmetric under MEAN_REVERTING (ratio 0.7). Cooldown 300s between rebalances.",
+    },
+    exit: {
+      notes: "Hold unless: (1) Sentinel returns EMERGENCY_WITHDRAW (|IL| ≥ 15%), (2) Sentinel returns HEDGE_DELTA and a perp venue is reachable, or (3) instructions are set on the position. Always run sentinel_evaluate_closed after a close to capture the reward signal.",
+    },
+    best_for: "Active IL-aware positions in volatile pools where regime can shift between sideways and trending within hours. Use when you have on-chain state accessible.",
+  },
 };
 
 function ensureDefaultStrategies() {

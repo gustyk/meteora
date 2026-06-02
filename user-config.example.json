@@ -109,5 +109,20 @@
   "hindsightAutoRecall": true,
   "hindsightAutoReflectEvery": 5,
   "hindsightRecallLimit": 6,
-  "hindsightRecallMaxChars": 1800
+  "hindsightRecallMaxChars": 1800,
+
+  "sentinelAlpha": 1.0,
+  "sentinelBeta": 2.0,
+  "sentinelGamma": 0.5,
+  "sentinelLambda": 1.0,
+  "sentinelPExitLow": 0.15,
+  "sentinelPExitHigh": 0.60,
+  "sentinelIlPctHedge": 2.0,
+  "sentinelIlPctEmergency": 15.0,
+  "sentinelVolHighThreshold": 3.5,
+  "sentinelTrendStrongThreshold": 0.4,
+  "sentinelMeanReversionThreshold": 0.6,
+  "sentinelRebalanceCooldownSec": 300,
+  "sentinelMaxSlippagePct": 0.3,
+  "sentinelHedgingSizePct": 0.5
 }
