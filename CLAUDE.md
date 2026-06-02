@@ -118,6 +118,79 @@ Before `deploy_position` executes:
 - SOL balance must cover `amount_y + gasReserve`
 - `blockedLaunchpads` enforced in `getTopCandidates()` before LLM sees candidates
 
+## SCREENER Performance Layer
+
+The screener was rebuilt for higher-quality deploy decisions. All improvements are backward-compatible and gated behind new config keys (default = current behavior, more determinism + memory + pre-fetch on top).
+
+### Prompt Architecture (`prompt.js` SCREENER section)
+
+The system prompt now opens with **lessons + Hindsight recall at the top** (highest priority), then Darwinian signal weights, then the structured reasoning template. The reasoning template forces the LLM to walk through each candidate against a 6-point checklist (hard rules → risk signals → narrative quality → pool memory → smart wallets → conviction score 1-10) before deciding. The deploy decision must be followed by a `MANDATORY PRE-DEPLOY SELF-CHECK` (5 unchecked boxes that must all be ☐✓) and a final `CONVICTION: <1-10>` line.
+
+`extractConvictionScore()` in `agent.js` parses the score from the LLM response and logs it to `decision-log.json`. Low-conviction deploys (`< minConvictionScore`, default 7) are flagged via `screening_warn` log for post-mortem analytics — the lessons system can later correlate conviction → PnL.
+
+### Per-Role Decoding (`config.llm.{screening, management, general}`)
+
+| Role | Temperature | Top-p | Rationale |
+|------|-------------|-------|-----------|
+| `screening` | 0.15 (was 0.373) | 0.9 | Rule application + ranking. Low temp = more deterministic deploy/skip decisions. |
+| `management` | 0.373 (unchanged) | 0.9 | Position management + trade-off reasoning. |
+| `general` | 0.373 (unchanged) | 0.9 | Chat + interactive. |
+
+Override per role via `screeningTemperature`, `screeningTopP`, etc. in `user-config.json`.
+
+### Pre-Fetch Enrichment (`tools/screening.js`, `index.js`)
+
+`compositeScore(pool, { smartWalletCount, poolMemorySignals })` returns a 0-100 pre-computed conviction score for each candidate. Formula:
+
+```
++ min(40, fee_tvl × 80)        // dominant signal
++ min(20, organic / 5)
++ min(15, smart_wallets × 7.5) // capped at 2 wallets
++ min(10, log10(volume) × 2.5)
++ min(5, log10(holders) × 2)
++ 5 if mcap in [200k, 2M]
++ 5 if volatility in [1, 4]
+− 10 if top10 > 60%
+− 10 if bundle_pct > 30%
+− 50 if is_rugpull
+− 50 if is_wash
+− 15 if is_pvp
+− 5 if dex_boost/dex_screener_paid
+− 20 if pool_memory.hasLoss
+− 10 if pool_memory.avgPnl < 0
+− 30 if pool_memory.cooldownActive
+```
+
+Candidates are now pre-sorted by composite score in `getTopCandidates()` so the LLM only sees the strongest setups first. The candidate block in the LLM goal also includes:
+- `composite_score: N/100` (pre-computed, used as tiebreaker)
+- `memory_flag: ⚠️ COOLDOWN ACTIVE | ⚠️ PAST LOSS | 🚨 HIGH-RISK POOL` (inline warning)
+
+### Targeted Hindsight Recall (`agent.js`)
+
+Per-role recall query shaping:
+- **SCREENER**: `screening precedent outcomes: tokens with similar mcap volatility organic_score smart_wallets deploy win loss pnl_pct lessons learned do not deploy rugpull bundle`
+- **MANAGER**: `position management rules: trailing take profit stop loss out of range rebalance sentinel il mitigation`
+- **GENERAL**: goal-as-is
+
+Results are injected into the system prompt as a "RELEVANT PAST EXPERIENCE" section above the reasoning template.
+
+### Architecture Modes (`runScreener()` in `agent.js`)
+
+Wraps the screener in 4 configurable modes, applied in order of priority:
+
+| Mode | Config | Behavior | When to use |
+|------|--------|----------|-------------|
+| **Tournament** | `screeningTournamentEnabled: true` + `screeningTournamentOpponent: <model>` | Run screening with both models in parallel. Deploy only if both agree on the same pool. Disagreement → NO DEPLOY. | When you have 2 models with different biases. Conservative pick. |
+| **Self-Consistency** | `screeningSelfConsistencyN: 3` (or N) | Run screening N times. Majority vote on the deployed pool. No majority → NO DEPLOY. | When model is uncertain. N=3 is typical. |
+| **Two-Stage** | `screeningTwoStageEnabled: true` + `screeningTwoStageModel: <cheap-model>` | Stage 1: cheap model gets the full candidate list and emits a JSON shortlist (top 3-5). Stage 2: top model decides on the shortlist. | When full list is large or top model is expensive. |
+| **Default** | all flags false | Single `agentLoop` call with `screeningModel`. | Default. |
+
+All three modes are **off by default** — opt-in via `user-config.json`. To enable two-stage: set `screeningTwoStageEnabled: true` and `screeningTwoStageModel: "openrouter/hunter-alpha"` (or any cheap model).
+
+### Decision-Log Integration
+
+`decision-log.json` now has a `conviction` field. The manager prompt's "RECENT DECISIONS" section shows the last 6 decisions with their conviction scores for cross-cycle trend analysis.
+
 ---
 
 ## bins_below Calculation (SCREENER)
@@ -303,3 +376,5 @@ Agent Meridian HiveMind sync is handled by `hivemind.js`. It uses built-in Agent
 
 - `lessons.js evolveThresholds()` evolves `maxVolatility` + `minFeeTvlRatio` (wrong key names — should be `minFeeActiveTvlRatio`; `maxVolatility` doesn't exist in config at all). The evolution is a no-op for those keys.
 - `get_wallet_positions` tool (dlmm.js) is in definitions.js but not in MANAGER_TOOLS or SCREENER_TOOLS — only available in GENERAL role.
+- `runScreener()` self-consistency / tournament / two-stage modes are opt-in. Default behavior unchanged.
+- Conviction enforcement is LOG-ONLY (analytics) — the deploy has already happened by the time we parse the score. The agent is supposed to self-enforce via the MANDATORY PRE-DEPLOY SELF-CHECK section in the prompt.

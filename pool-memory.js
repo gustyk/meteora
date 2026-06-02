@@ -336,6 +336,42 @@ export function recordPositionSnapshot(poolAddress, snapshot) {
  * Recall focused context for a specific pool — used before screening or management.
  * Returns a short formatted string ready for injection into the agent goal.
  */
+export function getPoolMemorySignals(poolAddress) {
+  if (!poolAddress) return null;
+  const db = load();
+  const entry = db[poolAddress];
+  if (!entry) return { exists: false, hasLoss: false, totalDeploys: 0, winRate: null, avgPnl: null, lastOutcome: null, cooldownActive: false, cooldownReason: null };
+
+  const cooldownActive = !!(entry.cooldown_until && new Date(entry.cooldown_until) > new Date());
+  const mintCooldownActive = !!(entry.base_mint_cooldown_until && new Date(entry.base_mint_cooldown_until) > new Date());
+  const lastDeploy = (entry.deploys || []).slice(-1)[0];
+  const hasLoss = (entry.deploys || []).some((d) => (d.pnl_pct ?? 0) < 0);
+  const winRate = entry.total_deploys > 0 ? entry.win_rate : null;
+  const avgPnl = entry.total_deploys > 0 ? entry.avg_pnl_pct : null;
+  const recentTrend = (() => {
+    const snaps = (entry.snapshots || []).slice(-6);
+    if (snaps.length < 2) return null;
+    const first = snaps[0];
+    const last = snaps[snaps.length - 1];
+    if (first.pnl_pct == null || last.pnl_pct == null) return null;
+    return last.pnl_pct - first.pnl_pct;
+  })();
+
+  return {
+    exists: true,
+    hasLoss,
+    totalDeploys: entry.total_deploys || 0,
+    winRate,
+    avgPnl,
+    lastOutcome: lastDeploy?.pnl_pct != null ? (lastDeploy.pnl_pct >= 0 ? "profit" : "loss") : null,
+    lastPnl: lastDeploy?.pnl_pct ?? null,
+    cooldownActive: cooldownActive || mintCooldownActive,
+    cooldownReason: entry.cooldown_reason || entry.base_mint_cooldown_reason || null,
+    recentTrend,
+    isHighRisk: hasLoss && (avgPnl ?? 0) < -10, // avg loss > 10% → mark high-risk
+  };
+}
+
 export function recallForPool(poolAddress) {
   if (!poolAddress) return null;
   const db = load();

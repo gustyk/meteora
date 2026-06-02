@@ -73,6 +73,9 @@ export const config = {
     maxMcap:           u.maxMcap           ?? 10_000_000,
     minBinStep:        u.minBinStep        ?? 80,
     maxBinStep:        u.maxBinStep        ?? 125,
+    // Minimum conviction (1-10) the screener LLM must report before deploy is allowed.
+    // Extracted from the LLM's final "CONVICTION: <n>" line. Below this = skip even if hard rules pass.
+    minConvictionScore: u.minConvictionScore ?? 7,
     timeframe:         u.timeframe         ?? "5m",
     category:          u.category          ?? "trending",
     minTokenFeesSol:   u.minTokenFeesSol   ?? 30,  // global fees paid (priority+jito tips). below = bundled/scam
@@ -137,6 +140,15 @@ export const config = {
   },
 
   // ─── LLM Settings ──────────────────────
+  // Model recommendations by role:
+  //   - screeningModel  : rule application + ranking → low-temp, deterministic
+  //     good options: openrouter/hunter-alpha (default), anthropic/claude-3.5-haiku,
+  //                   openai/gpt-4o-mini, google/gemini-2.0-flash-001
+  //   - managementModel : position management + trade-off reasoning → medium-temp
+  //     good options: openrouter/healer-alpha (default), anthropic/claude-3.5-sonnet,
+  //                   openai/gpt-4o-mini, deepseek/deepseek-chat-v3
+  //   - generalModel    : chat + interactive → medium-high temp
+  //     same options as managementModel
   llm: {
     temperature: u.temperature ?? 0.373,
     maxTokens:   u.maxTokens   ?? 4096,
@@ -144,6 +156,39 @@ export const config = {
     managementModel: u.managementModel ?? process.env.LLM_MODEL ?? "openrouter/healer-alpha",
     screeningModel:  u.screeningModel  ?? process.env.LLM_MODEL ?? "openrouter/hunter-alpha",
     generalModel:    u.generalModel    ?? process.env.LLM_MODEL ?? "openrouter/healer-alpha",
+
+    // Per-role decoding overrides — task-shaped temperatures produce more
+    // deterministic outputs where we want rule-application (screening) and
+    // more exploratory outputs where we want trade-off reasoning (management).
+    screening: {
+      // Screening is rule-application + ranking. Low temperature = more deterministic.
+      temperature:     u.screeningTemperature     ?? 0.15,
+      topP:            u.screeningTopP            ?? 0.9,
+      presencePenalty: u.screeningPresencePenalty ?? 0,
+      frequencyPenalty:u.screeningFrequencyPenalty?? 0,
+      // Two-stage: cheap model does bulk filtering, top model ranks the final shortlist.
+      // Leave primary null to skip two-stage. Requires a model name or "auto" (uses generalModel).
+      twoStageEnabled:  u.screeningTwoStageEnabled  ?? false,
+      twoStageModel:    u.screeningTwoStageModel    ?? null,
+      twoStageLimit:    u.screeningTwoStageLimit    ?? 3,  // top-N to forward to stage 2
+      // Self-consistency: sample N decisions, majority vote. Off by default (extra cost).
+      selfConsistencyN: u.screeningSelfConsistencyN ?? 1,
+      // Tournament: run with 2 models, pick the more conservative. Off by default.
+      tournamentEnabled: u.screeningTournamentEnabled ?? false,
+      tournamentOpponent: u.screeningTournamentOpponent ?? null,
+    },
+    management: {
+      temperature:     u.managementTemperature     ?? 0.373,
+      topP:            u.managementTopP            ?? 0.9,
+      presencePenalty: u.managementPresencePenalty ?? 0,
+      frequencyPenalty:u.managementFrequencyPenalty?? 0,
+    },
+    general: {
+      temperature:     u.generalTemperature     ?? 0.373,
+      topP:            u.generalTopP            ?? 0.9,
+      presencePenalty: u.generalPresencePenalty ?? 0,
+      frequencyPenalty:u.generalFrequencyPenalty?? 0,
+    },
   },
 
   // ─── Darwinian Signal Weighting ───────
@@ -316,7 +361,8 @@ export function reloadScreeningThresholds() {
     if (fresh.maxBundlePct      != null) s.maxBundlePct     = fresh.maxBundlePct;
     if (fresh.avoidPvpSymbols   !== undefined) s.avoidPvpSymbols = fresh.avoidPvpSymbols;
     if (fresh.blockPvpSymbols   !== undefined) s.blockPvpSymbols = fresh.blockPvpSymbols;
-    if (fresh.maxBotHoldersPct  != null) s.maxBotHoldersPct = fresh.maxBotHoldersPct;
+    if (fresh.maxBotHoldersPct  != null) s.maxBotHoldersPct  = fresh.maxBotHoldersPct;
+    if (fresh.minConvictionScore != null) s.minConvictionScore = fresh.minConvictionScore;
     if (fresh.allowedLaunchpads !== undefined) s.allowedLaunchpads = fresh.allowedLaunchpads;
     if (fresh.blockedLaunchpads !== undefined) s.blockedLaunchpads = fresh.blockedLaunchpads;
     const minBinsBelow = numericConfig(fresh.minBinsBelow) ?? config.strategy.minBinsBelow;

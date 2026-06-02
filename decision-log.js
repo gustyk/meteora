@@ -40,6 +40,7 @@ export function appendDecision(entry) {
     risks: Array.isArray(entry.risks) ? entry.risks.map((r) => sanitize(r, 140)).filter(Boolean).slice(0, 6) : [],
     metrics: entry.metrics || {},
     rejected: Array.isArray(entry.rejected) ? entry.rejected.map((r) => sanitize(r, 180)).filter(Boolean).slice(0, 8) : [],
+    conviction: Number.isFinite(entry.conviction) ? Math.max(1, Math.min(10, Math.round(entry.conviction))) : null,
   };
   data.decisions.unshift(decision);
   data.decisions = data.decisions.slice(0, MAX_DECISIONS);
@@ -62,6 +63,7 @@ export function getDecisionSummary(limit = 6) {
       d.reason ? `reason: ${d.reason}` : null,
       d.risks?.length ? `risks: ${d.risks.join(", ")}` : null,
       d.rejected?.length ? `rejected: ${d.rejected.join(" | ")}` : null,
+      d.conviction != null ? `conviction: ${d.conviction}/10` : null,
     ].filter(Boolean);
     return bits.join(" | ");
   }).join("\n");

@@ -3,7 +3,7 @@ import cron from "node-cron";
 import readline from "readline";
 import path from "path";
 import { fileURLToPath } from "url";
-import { agentLoop } from "./agent.js";
+import { agentLoop, extractConvictionScore, runScreener } from "./agent.js";
 import { log } from "./logger.js";
 import { getMyPositions, closePosition, getActiveBin } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
@@ -27,7 +27,8 @@ import {
 import { generateBriefing } from "./briefing.js";
 import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
-import { recordPositionSnapshot, recallForPool, addPoolNote } from "./pool-memory.js";
+import { recordPositionSnapshot, recallForPool, addPoolNote, getPoolMemorySignals } from "./pool-memory.js";
+import { compositeScore } from "./tools/screening.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
 import { getTokenNarrative, getTokenInfo } from "./tools/token.js";
 import { stageSignals } from "./signal-tracker.js";
@@ -474,15 +475,28 @@ export async function runScreeningCycle({ silent = false } = {}) {
         mint ? getTokenNarrative({ mint }) : Promise.resolve(null),
         mint ? getTokenInfo({ query: mint }) : Promise.resolve(null),
       ]);
+      const swResult = smartWallets.status === "fulfilled" ? smartWallets.value : null;
+      const swCount = swResult?.in_pool?.length ?? 0;
+      // Recompute composite score now that smart wallet count is known
+      if (pool._compositeScore != null) {
+        pool._compositeScore = compositeScore(pool, {
+          smartWalletCount: swCount,
+          poolMemorySignals: pool._poolMemorySignals,
+        });
+      }
       allCandidates.push({
         pool,
-        sw: smartWallets.status === "fulfilled" ? smartWallets.value : null,
+        sw: swResult,
         n: narrative.status === "fulfilled" ? narrative.value : null,
         ti: tokenInfo.status === "fulfilled" ? tokenInfo.value?.results?.[0] : null,
         mem: recallForPool(pool.pool),
+        memSignals: pool._poolMemorySignals || null,
+        compositeScore: pool._compositeScore ?? null,
       });
       await new Promise(r => setTimeout(r, 150)); // avoid 429s
     }
+    // Re-sort by composite score now that all enrichment is done
+    allCandidates.sort((a, b) => (b.compositeScore ?? 0) - (a.compositeScore ?? 0));
 
     // Hard filters after token recon — block launchpads and excessive Jupiter bot holders
     const filteredOut = [];
@@ -562,7 +576,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
     );
 
     // Build compact candidate blocks
-    const candidateBlocks = passing.map(({ pool, sw, n, ti, mem }, i) => {
+    const candidateBlocks = passing.map(({ pool, sw, n, ti, mem, memSignals, compositeScore: cScore }, i) => {
       const botPct = ti?.audit?.bot_holders_pct ?? "?";
       const top10Pct = ti?.audit?.top_holders_pct ?? "?";
       const feesSol = ti?.global_fees_sol ?? "?";
@@ -594,10 +608,21 @@ export async function runScreeningCycle({ silent = false } = {}) {
         ? `  pvp: HIGH — rival ${pool.pvp_rival_name || pool.pvp_symbol} (${pool.pvp_rival_mint?.slice(0, 8)}...) has pool ${pool.pvp_rival_pool?.slice(0, 8)}..., tvl=$${pool.pvp_rival_tvl}, holders=${pool.pvp_rival_holders}, fees=${pool.pvp_rival_fees}SOL`
         : null;
 
+      // Pre-computed memory flag — explicit warning to the LLM
+      const memoryFlag = memSignals
+        ? [
+            memSignals.cooldownActive ? "⚠️ COOLDOWN ACTIVE" : null,
+            memSignals.hasLoss ? `⚠️ PAST LOSS (${memSignals.totalDeploys} deploys, avg PnL ${memSignals.avgPnl ?? "?"}%)` : null,
+            memSignals.isHighRisk ? "🚨 HIGH-RISK POOL" : null,
+          ].filter(Boolean).join(" | ") || null
+        : null;
+
       const block = [
         `POOL: ${pool.name} (${pool.pool})`,
+        cScore != null ? `  composite_score: ${cScore}/100 (pre-computed conviction — use as tiebreaker, not a hard rule)` : null,
         `  metrics: bin_step=${pool.bin_step}, fee_pct=${pool.fee_pct}%, fee_tvl=${pool.fee_active_tvl_ratio}, vol=$${pool.volume_window}, tvl=$${pool.tvl ?? pool.active_tvl}, volatility_${pool.volatility_timeframe || "30m"}=${pool.volatility}, mcap=$${pool.mcap}, organic=${pool.organic_score}${pool.token_age_hours != null ? `, age=${pool.token_age_hours}h` : ""}`,
         `  audit: top10=${top10Pct}%, bots=${botPct}%, fees=${feesSol}SOL${launchpad ? `, launchpad=${launchpad}` : ""}`,
+        memoryFlag ? `  memory_flag: ${memoryFlag}` : null,
         pvpLine,
         okxParts ? `  okx: ${okxParts}` : okxUnavailable ? `  okx: unavailable` : null,
         okxTags  ? `  tags: ${okxTags}` : null,
@@ -632,97 +657,102 @@ export async function runScreeningCycle({ silent = false } = {}) {
 
     let deployAttempted = false;
     let deploySucceeded = false;
-    const { content } = await agentLoop(`
-SCREENING CYCLE
+    const { content } = await runScreener(`
+ SCREENING CYCLE
 ${strategyBlock}
 Positions: ${prePositions.total_positions}/${config.risk.maxPositions} | SOL: ${currentBalance.sol.toFixed(3)} | Deploy: ${deployAmount} SOL
 
 PRE-LOADED CANDIDATES (${passing.length} pools):
 ${candidateBlocks.join("\n\n")}
 
-STEPS:
-1. Decide if any candidate is actually worth deploying. One surviving candidate is not automatically good enough.
-2. Pick the best candidate based on narrative quality, smart wallets, and pool metrics.
-3. Call deploy_position (active_bin is pre-fetched above — no need to call get_active_bin).
-   bins_below = round(${config.strategy.minBinsBelow} + (candidate volatility/5)*(${config.strategy.maxBinsBelow - config.strategy.minBinsBelow})) clamped to [${config.strategy.minBinsBelow},${config.strategy.maxBinsBelow}].
-   pass deploy_position.volatility = the candidate volatility value.
-   For single-side SOL deploys, do not invent upside:
-   set amount_y only, keep amount_x = 0, keep bins_above = 0, and let the upper bin stay at the active bin.
-4. Report in this exact format (no tables, no extra sections):
-   🚀 DEPLOYED
+ STEPS:
+ 1. Decide if any candidate is actually worth deploying. One surviving candidate is not automatically good enough.
+ 2. Pick the best candidate based on narrative quality, smart wallets, and pool metrics.
+ 3. Call deploy_position (active_bin is pre-fetched above — no need to call get_active_bin).
+    bins_below = round(${config.strategy.minBinsBelow} + (candidate volatility/5)*(${config.strategy.maxBinsBelow - config.strategy.minBinsBelow})) clamped to [${config.strategy.minBinsBelow},${config.strategy.maxBinsBelow}].
+    pass deploy_position.volatility = the candidate volatility value.
+    For single-side SOL deploys, do not invent upside:
+    set amount_y only, keep amount_x = 0, keep bins_above = 0, and let the upper bin stay at the active bin.
+ 4. Report in this exact format (no tables, no extra sections):
+    🚀 DEPLOYED
 
-   <pool name>
-   <pool address>
+    <pool name>
+    <pool address>
 
-   ◎ <deploy amount> SOL | <strategy> | bin <active_bin>
-   Range: <minPrice> → <maxPrice>
-   Range cover: <downside %> downside | <upside %> upside | <total width %> total
+    ◎ <deploy amount> SOL | <strategy> | bin <active_bin>
+    Range: <minPrice> → <maxPrice>
+    Range cover: <downside %>% downside | <upside %>% upside | <total width %>% total
 
-   IMPORTANT:
-   - Do NOT calculate the range percentages yourself.
-   - Use the actual deploy_position tool result:
-     range_coverage.downside_pct
-     range_coverage.upside_pct
-     range_coverage.width_pct
+    IMPORTANT:
+    - Do NOT calculate the range percentages yourself.
+    - Use the actual deploy_position tool result:
+      range_coverage.downside_pct
+      range_coverage.upside_pct
+      range_coverage.width_pct
 
-   MARKET
-   Fee/TVL: <x>%
-   Volume: $<x>
-   TVL: $<x>
-   Volatility: <x>
-   Organic: <x>
-   Mcap: $<x>
-   Age: <x>h
+    MARKET
+    Fee/TVL: <x>%
+    Volume: $<x>
+    TVL: $<x>
+    Volatility: <x>
+    Organic: <x>
+    Mcap: $<x>
+    Age: <x>h
 
-   AUDIT
-   Top10: <x>%
-   Bots: <x>%
-   Fees paid: <x> SOL
-   Smart wallets: <names or none>
+    AUDIT
+    Top10: <x>%
+    Bots: <x>%
+    Fees paid: <x> SOL
+    Smart wallets: <names or none>
 
-   RISK
-   <If OKX advanced/risk data exists, list only the fields that actually exist: Risk level, Bundle, Sniper, Suspicious, ATH distance, Rugpull, Wash.>
-   <If only rugpull/wash exist, list just those.>
-   <If OKX enrichment is missing, write exactly: OKX: unavailable>
+    RISK
+    <If OKX advanced/risk data exists, list only the fields that actually exist: Risk level, Bundle, Sniper, Suspicious, ATH distance, Rugpull, Wash.>
+    <If only rugpull/wash exist, list just those.>
+    <If OKX enrichment is missing, write exactly: OKX: unavailable>
 
-   WHY THIS WON
-   <2-4 concise sentences on why this pool won, key risks, and why it still beat the alternatives>
-5. If no pool qualifies, report in this exact format instead:
-   ⛔ NO DEPLOY
+    WHY THIS WON
+    <2-4 concise sentences on why this pool won, key risks, and why it still beat the alternatives>
+ 5. If no pool qualifies, report in this exact format instead:
+    ⛔ NO DEPLOY
 
-   Cycle finished with no valid entry.
+    Cycle finished with no valid entry.
 
-   BEST LOOKING CANDIDATE
-   <name or none>
+    BEST LOOKING CANDIDATE
+    <name or none>
 
-   WHY SKIPPED
-   <2-4 concise sentences explaining why nothing was good enough>
+    WHY SKIPPED
+    <2-4 concise sentences explaining why nothing was good enough>
 
-   REJECTED
-   <short flat list of top candidate names and why they were skipped>
-IMPORTANT:
-- Never write "unknown" for OKX. Use real values, omit missing fields, or write exactly "OKX: unavailable".
-- Keep the whole report compact and highly scannable for Telegram.
-      `, config.llm.maxSteps, [], "SCREENER", config.llm.screeningModel, 2048, {
-        onToolStart: async ({ name }) => {
-          if (name === "deploy_position") deployAttempted = true;
-          await liveMessage?.toolStart(name);
-        },
-        onToolFinish: async ({ name, result, success }) => {
-          if (name === "deploy_position") {
-            deployAttempted = true;
-            deploySucceeded = Boolean(success && result?.success !== false && !result?.error && !result?.blocked);
-          }
-          await liveMessage?.toolFinish(name, result, success);
+    REJECTED
+    <short flat list of top candidate names and why they were skipped>
+ IMPORTANT:
+ - Never write "unknown" for OKX. Use real values, omit missing fields, or write exactly "OKX: unavailable".
+ - Keep the whole report compact and highly scannable for Telegram.
+      `, {
+        callbacks: {
+          onToolStart: async ({ name }) => {
+            if (name === "deploy_position") deployAttempted = true;
+            await liveMessage?.toolStart(name);
+          },
+          onToolFinish: async ({ name, result, success }) => {
+            if (name === "deploy_position") {
+              deployAttempted = true;
+              deploySucceeded = Boolean(success && result?.success !== false && !result?.error && !result?.blocked);
+            }
+            await liveMessage?.toolFinish(name, result, success);
+          },
         },
       });
     screenReport = content;
+    const conviction = extractConvictionScore(content);
+    const convictionThreshold = config.screening?.minConvictionScore ?? 7;
     if (/⛔\s*NO DEPLOY/i.test(content)) {
       appendDecision({
         type: "no_deploy",
         actor: "SCREENER",
         summary: "LLM chose no deploy",
         reason: stripThink(content).slice(0, 500),
+        conviction,
       });
     } else if (!deploySucceeded) {
       appendDecision({
@@ -730,6 +760,30 @@ IMPORTANT:
         actor: "SCREENER",
         summary: deployAttempted ? "Deploy attempt did not succeed" : "No successful deploy in screening cycle",
         reason: stripThink(content).slice(0, 500),
+        conviction,
+      });
+    } else {
+      // Deploy succeeded. Flag low-conviction deploys for analytics.
+      if (conviction != null && conviction < convictionThreshold) {
+        log("screening_warn", `Low-conviction deploy: ${conviction}/10 < ${convictionThreshold} threshold. Recorded for post-mortem.`);
+      }
+      appendDecision({
+        type: "deploy",
+        actor: "SCREENER",
+        pool: passing[0]?.pool?.pool || null,
+        pool_name: passing[0]?.pool?.name || null,
+        summary: `Deploy executed (conviction: ${conviction ?? "?"}/10, threshold: ${convictionThreshold})`,
+        reason: stripThink(content).slice(0, 500),
+        metrics: {
+          conviction,
+          convictionThreshold,
+          deployAmount,
+          volatility: passing[0]?.pool?.volatility,
+          binStep: passing[0]?.pool?.bin_step,
+          mcap: passing[0]?.pool?.mcap,
+          smartWallets: passing[0]?.sw?.in_pool?.length ?? 0,
+        },
+        conviction,
       });
     }
   } catch (error) {

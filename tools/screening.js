@@ -38,6 +38,64 @@ function scoreCandidate(pool) {
   return feeTvl * 1000 + organic * 10 + volume / 100 + holders / 100;
 }
 
+/**
+ * Composite conviction score for a candidate (0-100). Higher = stronger setup.
+ * Used for pre-ranking in getTopCandidates so only top-N reach the LLM.
+ *
+ *   signal layout (weighted):
+ *     - fee/active_tvl_ratio: dominant signal (40%)
+ *     - organic_score:        20%
+ *     - smart_wallets:        +15% flat boost per wallet (capped at 2)
+ *     - volume:               10%
+ *     - holders:              5%
+ *     - mcap sweet-spot:      +5% if 200k..2M
+ *     - volatility sweet:     +5% if 1..4
+ *
+ *   risk penalties (subtract from total):
+ *     - top10 > 60%          -10
+ *     - bundle_pct > 30%     -10
+ *     - is_rugpull           -50
+ *     - is_wash              -50
+ *     - is_pvp               -15
+ *     - dex_boost / paid     -5
+ *     - pool_memory hasLoss  -20
+ *     - pool_memory avgPnl<0 -10
+ */
+export function compositeScore(pool, { smartWalletCount = 0, poolMemorySignals = null } = {}) {
+  const feeTvl = Number(pool.fee_active_tvl_ratio || 0);
+  const organic = Number(pool.organic_score || 0);
+  const volume = Number(pool.volume_window || 0);
+  const holders = Number(pool.holders || 0);
+  const mcap = Number(pool.mcap || 0);
+  const vol = Number(pool.volatility || 0);
+  const top10 = Number(pool.top10_pct || 0);
+  const bundle = Number(pool.bundle_pct || 0);
+
+  let score = 0;
+
+  // Positive signals
+  score += Math.min(40, feeTvl * 80);          // 0.5% fee_tvl = 40 pts
+  score += Math.min(20, organic / 5);          // 100 organic = 20 pts
+  score += Math.min(15, smartWalletCount * 7.5); // 2 wallets = 15 pts
+  score += Math.min(10, Math.log10(Math.max(1, volume)) * 2.5); // log scale
+  score += Math.min(5, Math.log10(Math.max(1, holders)) * 2);
+  if (mcap >= 200_000 && mcap <= 2_000_000) score += 5;
+  if (vol >= 1 && vol <= 4) score += 5;
+
+  // Risk penalties
+  if (top10 > 60) score -= 10;
+  if (bundle > 30) score -= 10;
+  if (pool.is_rugpull) score -= 50;
+  if (pool.is_wash) score -= 50;
+  if (pool.is_pvp) score -= 15;
+  if (pool.dex_boost || pool.dex_screener_paid) score -= 5;
+  if (poolMemorySignals?.hasLoss) score -= 20;
+  if (poolMemorySignals?.avgPnl != null && poolMemorySignals.avgPnl < 0) score -= 10;
+  if (poolMemorySignals?.cooldownActive) score -= 30;
+
+  return Math.max(0, Math.round(score));
+}
+
 function numeric(value) {
   if (value == null) return null;
   const n = Number(value);
@@ -595,9 +653,24 @@ export async function getTopCandidates({ limit = 10 } = {}) {
         return false;
       }
       return true;
-    })
+    });
+
+  // Compute composite conviction score for each eligible pool (0-100).
+  // Pool memory signals are cheap to fetch — only top 15 by scoreCandidate.
+  const { getPoolMemorySignals } = await import("../pool-memory.js");
+  const preTop = [...eligible]
     .sort((a, b) => scoreCandidate(b) - scoreCandidate(a))
-    .slice(0, limit);
+    .slice(0, 15);
+  for (const p of preTop) {
+    p._poolMemorySignals = getPoolMemorySignals(p.pool) || { exists: false, hasLoss: false, cooldownActive: false };
+    p._compositeScore = compositeScore(p, {
+      smartWalletCount: 0, // not yet known at this stage — enriched later
+      poolMemorySignals: p._poolMemorySignals,
+    });
+  }
+
+  const ranked = [...eligible].sort((a, b) => (b._compositeScore ?? 0) - (a._compositeScore ?? 0));
+  const eligibleSliced = ranked.slice(0, limit);
 
   if (config.screening.avoidPvpSymbols && eligible.length > 0) {
     await enrichPvpRisk(eligible);

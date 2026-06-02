@@ -117,6 +117,44 @@ function shouldRequireRealToolUse(goal, agentType, interactive = false) {
   return interactive && LIVE_DATA_TOOL_INTENTS.test(goal);
 }
 
+/**
+ * Resolve decoding parameters for a given agent role.
+ * Falls back to global llm.temperature if per-role not set.
+ */
+function getDecodingParams(agentType) {
+  const llm = config.llm || {};
+  const role = llm[(agentType || "general").toLowerCase()] || {};
+  return {
+    temperature:     role.temperature     ?? llm.temperature ?? 0.373,
+    top_p:           role.topP            ?? 0.9,
+    presence_penalty:role.presencePenalty ?? 0,
+    frequency_penalty:role.frequencyPenalty?? 0,
+  };
+}
+
+/**
+ * Extract a conviction score (1-10) from a screening response.
+ * Looks for "CONVICTION: <n>" line; falls back to scanning the last
+ * few lines for "conviction" or "score" patterns. Returns null if not found.
+ */
+export function extractConvictionScore(text) {
+  if (!text) return null;
+  const cleaned = String(text).replace(/<think>[\s\S]*?<\/think>/gi, "");
+  // Primary pattern: "CONVICTION: <n>" or "CONVICTION: <n>/10" (case-insensitive, integers only)
+  const m1 = cleaned.match(/CONVICTION\s*[:=]\s*(\d{1,2})(?:\s*\/\s*10)?(?!\.)/i);
+  if (m1) {
+    const n = Number(m1[1]);
+    if (Number.isFinite(n) && n >= 1 && n <= 10) return n;
+  }
+  // Fallback: "score: 8/10", "conviction 7"
+  const m2 = cleaned.match(/(?:conviction|score|confidence)[^.\n]{0,30}?(\d{1,2})\s*\/\s*10/i);
+  if (m2) {
+    const n = Number(m2[1]);
+    if (Number.isFinite(n) && n >= 1 && n <= 10) return n;
+  }
+  return null;
+}
+
 function buildMessages(systemPrompt, sessionHistory, goal, providerMode = "system") {
   if (providerMode === "user_embedded") {
     return [
@@ -178,8 +216,19 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
   let hindsightContext = null;
   if (config.hindsight?.enabled && config.hindsight?.autoRecall && hindsightAvailable() && goal) {
     try {
-      const recallQuery = `${agentType} ${goal}`.slice(0, 400);
-      const recalled = await hindsightRecallLessons(recallQuery, { limit: config.hindsight.recallLimit || 6 });
+      // Per-role recall query shaping — SCREENER wants precedent on
+      // "similar profile" deploys, MANAGER wants position management rules,
+      // GENERAL wants the goal as-is.
+      let recallQuery;
+      if (agentType === "SCREENER") {
+        recallQuery = `screening precedent outcomes: tokens with similar mcap volatility organic_score smart_wallets deploy win loss pnl_pct lessons learned do not deploy rugpull bundle`;
+      } else if (agentType === "MANAGER") {
+        recallQuery = `position management rules: trailing take profit stop loss out of range rebalance sentinel il mitigation`;
+      } else {
+        recallQuery = goal;
+      }
+      const recallQueryFinal = `${recallQuery} ${goal}`.slice(0, 500);
+      const recalled = await hindsightRecallLessons(recallQueryFinal, { limit: config.hindsight.recallLimit || 6 });
       hindsightContext = formatRecallResults(recalled, { maxChars: config.hindsight.recallMaxChars || 1800 });
       if (hindsightContext) {
         log("hindsight", `Injected ${recalled.length} recalled memory item(s) for ${agentType} goal`);
@@ -226,7 +275,7 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
             model: usedModel,
             messages,
             tools: getToolsForRole(agentType, goal),
-            temperature: config.llm.temperature,
+            ...getDecodingParams(agentType),
             max_tokens: maxOutputTokens ?? config.llm.maxTokens,
           };
           if (!omitToolChoice) reqParams.tool_choice = toolChoice;
@@ -431,4 +480,185 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ─── Screening wrappers: two-stage / self-consistency / tournament ──
+
+/**
+ * Stage-1 of two-stage screening: cheap model shortlists top-N candidates.
+ * Returns an array of candidate "names" (pool name strings) extracted from a
+ * JSON object the model emits. Falls back to [] on any parse failure.
+ *
+ * The goal should be a self-contained summary of the candidates (no on-chain
+ * tools required). This is a TEXT-IN, JSON-OUT task with temperature 0.
+ */
+async function stage1Shortlist(goal, model) {
+  const stage1Prompt = `${goal}
+
+TASK: Pick the top 3-5 most promising pools from the list above based ONLY on the pre-computed composite_score, smart_wallets, narrative_quality, and memory_flag fields. Do NOT do any tool calls. Output ONLY a JSON object — no prose, no markdown, no explanation.
+
+FORMAT (strict):
+{"shortlist": ["POOL NAME 1", "POOL NAME 2", "POOL NAME 3"]}
+
+If nothing looks promising, output:
+{"shortlist": []}
+`;
+  try {
+    const res = await client.chat.completions.create({
+      model,
+      messages: [
+        { role: "system", content: "You are a fast pre-filter. Output ONLY valid JSON. No prose. No markdown." },
+        { role: "user", content: stage1Prompt },
+      ],
+      temperature: 0,
+      max_tokens: 400,
+      response_format: { type: "json_object" },
+    });
+    const text = res.choices?.[0]?.message?.content || "{}";
+    const parsed = JSON.parse(jsonrepair(text));
+    const list = Array.isArray(parsed.shortlist) ? parsed.shortlist : [];
+    return list.map((s) => String(s).trim()).filter(Boolean).slice(0, 5);
+  } catch (error) {
+    log("warn", `stage1Shortlist failed: ${error.message}`);
+    return [];
+  }
+}
+
+/**
+ * Filter a pre-built candidate goal down to only the named shortlist.
+ * The goal contains "POOL: <name> ... <pool address>" blocks separated by
+ * blank lines. We keep blocks whose `POOL:` line matches a shortlist name.
+ */
+function filterGoalByShortlist(goal, shortlist) {
+  if (!Array.isArray(shortlist) || shortlist.length === 0) return goal;
+  const blocks = goal.split(/\n\n+/);
+  const lower = new Set(shortlist.map((s) => s.toLowerCase()));
+  const keepBlocks = blocks.filter((block) => {
+    const m = block.match(/^POOL:\s*([^\n(]+?)\s*\(/);
+    if (!m) return false;
+    return lower.has(m[1].trim().toLowerCase());
+  });
+  return keepBlocks.length > 0 ? keepBlocks.join("\n\n") : goal;
+}
+
+/**
+ * Stage-2 of two-stage screening: top model does final decision on shortlist.
+ * Same call shape as the original agentLoop but with a filtered goal.
+ */
+async function stage2Decide(goal, options) {
+  return agentLoop(goal, config.llm.maxSteps, [], "SCREENER", options.screeningModel, 2048, options.callbacks || {});
+}
+
+/**
+ * Extract the deployed pool name from a screening response.
+ * Looks for the "POOL: <name> (address)" line in the "DEPLOYED" block, or
+ * the "BEST LOOKING CANDIDATE" line in a NO DEPLOY report.
+ */
+function extractDeployedName(text) {
+  if (!text) return null;
+  const cleaned = String(text).replace(/<think>[\s\S]*?<\/think>/gi, "");
+  // DEPLOYED case
+  const m1 = cleaned.match(/🚀\s*DEPLOYED[\s\S]*?POOL:\s*([^\n(]+?)\s*\(/i);
+  if (m1) return m1[1].trim();
+  // Fallback: first POOL: <name> after DEPLOYED marker
+  if (/🚀\s*DEPLOYED/i.test(cleaned)) {
+    const m1b = cleaned.match(/POOL:\s*([^\n(]+?)\s*\(/);
+    if (m1b) return m1b[1].trim();
+  }
+  return null;
+}
+
+/**
+ * Extract a "no deploy" outcome marker from a screening response.
+ * Returns true if the response is a NO DEPLOY report.
+ */
+function isNoDeployReport(text) {
+  if (!text) return false;
+  return /⛔\s*NO DEPLOY/i.test(String(text).replace(/<think>[\s\S]*?<\/think>/gi, ""));
+}
+
+/**
+ * High-level screening wrapper. Supports four modes:
+ *   1. default: single agentLoop call
+ *   2. two-stage: cheap model shortlists → top model decides on shortlist
+ *   3. self-consistency: N parallel calls, majority vote
+ *   4. tournament: two models, only deploy if BOTH agree
+ *
+ * Returns the agent's final response shape: { content, userMessage }.
+ * The 'silent' option suppresses progress logging.
+ */
+export async function runScreener(goal, options = {}) {
+  const sc = config.llm?.screening || {};
+  const callbacks = options.callbacks || {};
+  const silent = Boolean(options.silent);
+  const screeningModel = options.screeningModel || config.llm.screeningModel;
+
+  // Mode 4: tournament (two models, conservative pick)
+  if (sc.tournamentEnabled && sc.tournamentOpponent) {
+    const opponent = sc.tournamentOpponent;
+    if (!silent) log("screening", `Tournament: ${screeningModel} vs ${opponent} (conservative wins)`);
+    const [resA, resB] = await Promise.all([
+      agentLoop(goal, config.llm.maxSteps, [], "SCREENER", screeningModel, 2048, callbacks).catch((e) => ({ content: `⛔ NO DEPLOY\n\nTournament model A failed: ${e.message}` })),
+      agentLoop(goal, config.llm.maxSteps, [], "SCREENER", opponent, 2048, callbacks).catch((e) => ({ content: `⛔ NO DEPLOY\n\nTournament model B failed: ${e.message}` })),
+    ]);
+    const aDeploy = !isNoDeployReport(resA?.content) && extractDeployedName(resA?.content);
+    const bDeploy = !isNoDeployReport(resB?.content) && extractDeployedName(resB?.content);
+    if (aDeploy && bDeploy && aDeploy.toLowerCase() === bDeploy.toLowerCase()) {
+      if (!silent) log("screening", `Tournament: both models agree on ${aDeploy} → DEPLOY`);
+      return resA;
+    }
+    // Conservative: pick the one that says NO DEPLOY, or resA's NO DEPLOY if both deploy but disagree
+    if (!silent) log("screening", `Tournament: models disagree (A=${aDeploy ?? "no_deploy"}, B=${bDeploy ?? "no_deploy"}) → NO DEPLOY`);
+    return { content: `⛔ NO DEPLOY\n\nTournament: models disagree (${screeningModel}=${aDeploy ?? "no_deploy"}, ${opponent}=${bDeploy ?? "no_deploy"}). Conservative pick: no deploy.\n\n---\nMODEL A:\n${resA?.content ?? ""}\n\n---\nMODEL B:\n${resB?.content ?? ""}` };
+  }
+
+  // Mode 3: self-consistency (N parallel calls, majority vote)
+  const n = Math.max(1, Number(sc.selfConsistencyN) || 1);
+  if (n > 1) {
+    if (!silent) log("screening", `Self-consistency: ${n} parallel calls`);
+    const samples = await Promise.all(
+      Array.from({ length: n }).map(() =>
+        agentLoop(goal, config.llm.maxSteps, [], "SCREENER", screeningModel, 2048, callbacks)
+          .catch((e) => ({ content: `⛔ NO DEPLOY\n\nSelf-consistency sample failed: ${e.message}` }))
+      )
+    );
+    const tally = new Map();
+    let noDeployCount = 0;
+    for (const s of samples) {
+      if (isNoDeployReport(s?.content)) { noDeployCount++; continue; }
+      const name = extractDeployedName(s?.content);
+      if (name) {
+        const key = name.toLowerCase();
+        tally.set(key, (tally.get(key) || 0) + 1);
+      }
+    }
+    const winner = [...tally.entries()].sort((a, b) => b[1] - a[1])[0];
+    if (winner && winner[1] > n / 2) {
+      if (!silent) log("screening", `Self-consistency: majority picked ${winner[0]} (${winner[1]}/${n}) → DEPLOY`);
+      const matchIdx = samples.findIndex((s) => extractDeployedName(s?.content)?.toLowerCase() === winner[0]);
+      return samples[matchIdx >= 0 ? matchIdx : 0];
+    }
+    if (!silent) log("screening", `Self-consistency: no majority (noDeploy=${noDeployCount}, deploys=${[...tally.values()].join(",")}) → NO DEPLOY`);
+    return { content: `⛔ NO DEPLOY\n\nSelf-consistency: no majority across ${n} samples (no_deploy=${noDeployCount}, deploys=${[...tally.entries()].map(([k, v]) => `${k}=${v}`).join(", ") || "none"}). Conservative pick: no deploy.` };
+  }
+
+  // Mode 2: two-stage (cheap filter → top model)
+  if (sc.twoStageEnabled && sc.twoStageModel) {
+    const filterModel = sc.twoStageModel;
+    if (!silent) log("screening", `Two-stage: filter=${filterModel}, decider=${screeningModel}, limit=${sc.twoStageLimit}`);
+    const shortlist = await stage1Shortlist(goal, filterModel);
+    if (shortlist.length === 0) {
+      if (!silent) log("screening", `Two-stage: filter produced empty shortlist → NO DEPLOY`);
+      return { content: "⛔ NO DEPLOY\n\nTwo-stage filter produced empty shortlist. Nothing passed the cheap filter." };
+    }
+    if (!silent) log("screening", `Two-stage: shortlist=[${shortlist.join(", ")}]`);
+    const filteredGoal = filterGoalByShortlist(goal, shortlist);
+    if (filteredGoal === goal) {
+      if (!silent) log("screening_warn", `Two-stage: shortlist names did not match any blocks; falling back to full goal`);
+    }
+    return stage2Decide(filteredGoal, { ...options, screeningModel });
+  }
+
+  // Mode 1: default single call
+  return agentLoop(goal, config.llm.maxSteps, [], "SCREENER", screeningModel, 2048, callbacks);
 }

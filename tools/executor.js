@@ -239,6 +239,8 @@ function normalizeConfigValue(key, value) {
     "managementModel",
     "screeningModel",
     "generalModel",
+    "screeningTwoStageModel",
+    "screeningTournamentOpponent",
     "hiveMindUrl",
     "hiveMindApiKey",
     "agentId",
@@ -246,8 +248,12 @@ function normalizeConfigValue(key, value) {
     "publicApiKey",
     "agentMeridianApiUrl",
   ]);
+  const booleanKeys2 = new Set([
+    "screeningTwoStageEnabled",
+    "screeningTournamentEnabled",
+  ]);
   if (value === null) return null;
-  if (booleanKeys.has(key)) return coerceBoolean(value, key);
+  if (booleanKeys.has(key) || booleanKeys2.has(key)) return coerceBoolean(value, key);
   if (arrayKeys.has(key)) return coerceStringArray(value, key);
   if (stringKeys.has(key)) return coerceString(value, key);
   return coerceFiniteNumber(value, key);
@@ -531,6 +537,23 @@ const toolMap = {
       temperature: ["llm", "temperature"],
       maxTokens: ["llm", "maxTokens"],
       maxSteps: ["llm", "maxSteps"],
+      // per-role decoding
+      screeningTemperature:      ["llm", "screening", "temperature"],
+      screeningTopP:             ["llm", "screening", "topP"],
+      screeningPresencePenalty:  ["llm", "screening", "presencePenalty"],
+      screeningFrequencyPenalty: ["llm", "screening", "frequencyPenalty"],
+      screeningTwoStageEnabled:  ["llm", "screening", "twoStageEnabled"],
+      screeningTwoStageModel:    ["llm", "screening", "twoStageModel"],
+      screeningTwoStageLimit:    ["llm", "screening", "twoStageLimit"],
+      screeningSelfConsistencyN: ["llm", "screening", "selfConsistencyN"],
+      screeningTournamentEnabled: ["llm", "screening", "tournamentEnabled"],
+      screeningTournamentOpponent: ["llm", "screening", "tournamentOpponent"],
+      managementTemperature:     ["llm", "management", "temperature"],
+      managementTopP:            ["llm", "management", "topP"],
+      generalTemperature:        ["llm", "general", "temperature"],
+      generalTopP:               ["llm", "general", "topP"],
+      // conviction threshold
+      minConvictionScore:        ["screening", "minConvictionScore"],
       // strategy
       strategy: ["strategy", "strategy"],
       binsBelow: ["strategy", "maxBinsBelow", ["maxBinsBelow"]],
@@ -607,10 +630,13 @@ const toolMap = {
 
     // Apply to live config immediately after the persisted config is known-good.
     for (const [key, val] of Object.entries(applied)) {
-      const [section, field] = CONFIG_MAP[key];
-      const before = config[section][field];
-      config[section][field] = val;
-      log("config", `update_config: config.${section}.${field} ${before} → ${val} (verify: ${config[section][field]})`);
+      const path = CONFIG_MAP[key];
+      const [section, subsection, field] = path;
+      const before = subsection ? config[section][subsection][field] : config[section][field];
+      if (subsection) config[section][subsection][field] = val;
+      else config[section][field] = val;
+      const verify = subsection ? config[section][subsection][field] : config[section][field];
+      log("config", `update_config: ${path.join(".")} ${before} → ${val} (verify: ${verify})`);
     }
     if (
       applied.binsBelow != null ||
