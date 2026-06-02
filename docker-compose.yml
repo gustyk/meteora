@@ -1,0 +1,61 @@
+name: meridian
+
+# Hindsight — biomimetic memory service for the Meridian DLMM agent.
+# When HINDSIGHT_ENABLED=true in Meridian's config, the agent retains
+# closed-position lessons, pool facts, and strategies here, and uses
+# recall() + reflect() to surface relevant context to the LLM.
+#
+# Bring up:    docker compose up -d hindsight
+# View logs:   docker compose logs -f hindsight
+# Stop:        docker compose down
+#
+# API:   http://localhost:8888  (used by @vectorize-io/hindsight-client)
+# UI:    http://localhost:9999  (browse banks/graphs)
+#
+# Hindsight uses its own LLM for retain/recall/reflect. Uncomment one of
+# the HINDSIGHT_API_LLM_* blocks below and provide credentials.
+# See https://hindsight.vectorize.io/developer/models for supported providers.
+
+services:
+  hindsight:
+    image: ghcr.io/vectorize-io/hindsight:latest
+    container_name: meridian-hindsight
+    restart: unless-stopped
+    ports:
+      - "8888:8888"   # API
+      - "9999:9999"   # UI
+    environment:
+      # ── LLM provider (required) — pick one ──
+      # OpenAI:
+      # HINDSIGHT_API_LLM_PROVIDER: openai
+      # HINDSIGHT_API_LLM_API_KEY: ${OPENAI_API_KEY}
+      # HINDSIGHT_API_LLM_MODEL: gpt-5-mini
+
+      # Anthropic:
+      # HINDSIGHT_API_LLM_PROVIDER: anthropic
+      # HINDSIGHT_API_LLM_API_KEY: ${ANTHROPIC_API_KEY}
+      # HINDSIGHT_API_LLM_MODEL: claude-sonnet-4.5
+
+      # Ollama (local, no key):
+      # HINDSIGHT_API_LLM_PROVIDER: ollama
+      # HINDSIGHT_API_LLM_BASE_URL: http://host.docker.internal:11434/v1
+      # HINDSIGHT_API_LLM_MODEL: llama3.1
+
+      # ── Storage ──
+      HINDSIGHT_API_LOG_LEVEL: ${HINDSIGHT_LOG_LEVEL:-info}
+    volumes:
+      - hindsight-data:/home/hindsight/.pg0
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8888/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  hindsight-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${PWD}/.hindsight-data

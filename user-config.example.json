@@ -101,5 +101,13 @@
   "telegramChatId": "",
   "hiveMindUrl": "",
   "hiveMindApiKey": "",
-  "hiveMindPullMode": "auto"
+  "hiveMindPullMode": "auto",
+
+  "hindsightEnabled": false,
+  "hindsightUrl": "http://localhost:8888",
+  "hindsightBankPrefix": "meridian",
+  "hindsightAutoRecall": false,
+  "hindsightAutoReflectEvery": 5,
+  "hindsightRecallLimit": 6,
+  "hindsightRecallMaxChars": 1800
 }

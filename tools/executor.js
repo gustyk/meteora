@@ -22,6 +22,14 @@ import { addSmartWallet, removeSmartWallet, listSmartWallets, checkSmartWalletsO
 import { getTokenInfo, getTokenHolders, getTokenNarrative } from "./token.js";
 import { config, reloadScreeningThresholds, MIN_SAFE_BINS_BELOW } from "../config.js";
 import { getRecentDecisions } from "../decision-log.js";
+import {
+  isAvailable as hindsightAvailable,
+  getBanks as hindsightBanks,
+  retain as hindsightRetain,
+  recall as hindsightRecall,
+  reflect as hindsightReflect,
+  formatRecallResults,
+} from "../hindsight.js";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -300,6 +308,54 @@ const toolMap = {
   add_pool_note: addPoolNote,
   add_to_blacklist: addToBlacklist,
   remove_from_blacklist: removeFromBlacklist,
+
+  // ─── Hindsight memory tools ───────────────────────────────
+  recall_memory: async ({ bank, query, limit }) => {
+    if (!hindsightAvailable()) {
+      return { available: false, count: 0, results: [], note: "Hindsight disabled or unreachable — using local JSON files." };
+    }
+    const banks = hindsightBanks() || {};
+    const bankId = banks[bank] || banks.lessons;
+    const results = await hindsightRecall(bankId, query);
+    const trimmed = typeof limit === "number" ? results.slice(0, limit) : results;
+    return {
+      available: true,
+      bank: bankId,
+      count: trimmed.length,
+      results: trimmed,
+      formatted: formatRecallResults(trimmed) || "(no relevant memories)",
+    };
+  },
+  reflect_on_memory: async ({ bank, query }) => {
+    if (!hindsightAvailable()) {
+      return { available: false, text: null, note: "Hindsight disabled or unreachable." };
+    }
+    const banks = hindsightBanks() || {};
+    const bankId = banks[bank] || banks.lessons;
+    const text = await hindsightReflect(bankId, query);
+    if (text) {
+      // Auto-retain the reflection result so it shows up in future recall
+      void hindsightRetain(banks.reflections, text, {
+        context: `manual_reflection:${bank}`,
+        timestamp: new Date().toISOString(),
+        metadata: { type: "reflection", source: "manual", bank },
+      });
+    }
+    return { available: true, bank: bankId, text };
+  },
+  retain_memory: async ({ bank, content, context }) => {
+    if (!hindsightAvailable()) {
+      return { available: false, retained: false, note: "Hindsight disabled or unreachable." };
+    }
+    const banks = hindsightBanks() || {};
+    const bankId = banks[bank];
+    if (!bankId) return { available: true, retained: false, error: `Unknown bank: ${bank}` };
+    const result = await hindsightRetain(bankId, content, {
+      context: context || `manual:${bank}`,
+      timestamp: new Date().toISOString(),
+    });
+    return { available: true, retained: result != null, bank: bankId };
+  },
   list_blacklist: listBlacklist,
   block_deployer: blockDev,
   unblock_deployer: unblockDev,

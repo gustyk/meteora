@@ -29,6 +29,7 @@
   "dependencies": {
     "@meteora-ag/dlmm": "1.9.4",
     "@solana/web3.js": "^1.95.0",
+    "@vectorize-io/hindsight-client": "^0.7.1",
     "bn.js": "^5.2.1",
     "bs58": "^5.0.0",
     "dotenv": "^17.3.1",

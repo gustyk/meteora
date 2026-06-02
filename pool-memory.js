@@ -8,6 +8,11 @@
 import fs from "fs";
 import { log } from "./logger.js";
 import { config } from "./config.js";
+import {
+  isAvailable as hindsightAvailable,
+  retainPoolDeploy as hindsightRetainDeploy,
+  retainPoolFact as hindsightRetainFact,
+} from "./hindsight.js";
 
 const POOL_MEMORY_FILE = "./pool-memory.json";
 const MAX_NOTE_LENGTH = 280;
@@ -213,6 +218,11 @@ export function recordPoolDeploy(poolAddress, deployData) {
 
   save(db);
   log("pool-memory", `Recorded deploy for ${entry.name} (${poolAddress.slice(0, 8)}): PnL ${deploy.pnl_pct}%`);
+
+  // Hindsight: retain the deploy outcome to the memory layer (fire-and-forget).
+  if (hindsightAvailable()) {
+    void hindsightRetainDeploy({ ...deploy, pool_address: poolAddress }, entry);
+  }
 }
 
 export function isPoolOnCooldown(poolAddress) {
@@ -401,5 +411,14 @@ export function addPoolNote({ pool_address, note }) {
 
   save(db);
   log("pool-memory", `Note added to ${pool_address.slice(0, 8)}: ${safeNote}`);
+
+  // Hindsight: retain the operator note as a pool fact (fire-and-forget).
+  if (hindsightAvailable()) {
+    void hindsightRetainFact(pool_address, `Note: ${safeNote}`, {
+      context: `pool_note:${pool_address}`,
+      timestamp: new Date().toISOString(),
+      metadata: { type: "pool_note", pool: pool_address },
+    });
+  }
   return { saved: true, pool_address, note: safeNote };
 }

@@ -196,6 +196,43 @@ const actualBaseFee = baseFactor > 0
 - Performance recorded via `recordPerformance()` called from executor.js after `close_position`
 - **Known issue**: `evolveThresholds()` references `maxVolatility` and `minFeeTvlRatio` but config.js uses `minFeeActiveTvlRatio` and has no `maxVolatility` key — the evolution of these keys is a no-op
 
+## Hindsight Memory Layer
+
+`hindsight.js` is an optional biomimetic memory service that runs separately as a Docker container (port 8888). When `HINDSIGHT_ENABLED=true` and the service is reachable, Meridian augments its local JSON memory (`lessons.json`, `pool-memory.json`, `strategy-library.json`) with structured retain/recall/reflect.
+
+**Operations:**
+- `retain(bank, content, opts)` — store world facts, experiences, or mental models
+- `recall(bank, query, opts)` — search using 4 parallel strategies: semantic vectors, BM25 keywords, entity/temporal/causal graph, time range. Fused via RRF + cross-encoder rerank.
+- `reflect(bank, query, opts)` — deep analysis that derives new insights from existing memories
+
+**Banks** (prefix configurable via `hindsight.bankPrefix`, default `meridian`):
+- `{prefix}_lessons`      — closed-position rules and outcomes
+- `{prefix}_pools`        — per-pool facts, deploy history, snapshots, cooldowns, operator notes
+- `{prefix}_strategies`   — LP strategy library (defaults + custom)
+- `{prefix}_reflections`  — mental models from periodic auto-reflect
+
+**Auto-wiring:**
+- `lessons.js → recordPerformance()` retains the lesson + performance to the `lessons` bank
+- `pool-memory.js → recordPoolDeploy()` retains the deploy outcome to the `pools` bank
+- `pool-memory.js → addPoolNote()` retains operator notes to the `pools` bank
+- `strategy-library.js → addStrategy()` retains the strategy to the `strategies` bank
+- Every 5 closed positions, `hindsightReflect()` runs a deep reflection on accumulated performance and retains the result to `reflections`
+- If `hindsight.autoRecall` is true, `agent.js → agentLoop()` calls `recallLessons()` before each LLM call and injects results as a "RELEVANT PAST EXPERIENCE" section in the system prompt
+
+**Tools exposed to the LLM** (in `tools/definitions.js`):
+- `recall_memory` — search a bank with a natural-language query
+- `reflect_on_memory` — derive insights from a bank
+- `retain_memory` — explicitly store a memory (auto-capture covers most cases)
+
+**Fail-safe:** When Hindsight is disabled, unreachable, or the npm client is not installed, every call returns `null`/`[]` and Meridian keeps using local JSON files. No code path depends on Hindsight being up.
+
+**Setup:**
+1. `npm install` (pulls `@vectorize-io/hindsight-client`)
+2. Edit `docker-compose.yml` to uncomment one `HINDSIGHT_API_LLM_*` block (OpenAI/Anthropic/Ollama)
+3. `docker compose up -d hindsight` — wait for `http://localhost:8888/health` to return 200
+4. Set `hindsightEnabled: true` in `user-config.json` (or `HINDSIGHT_ENABLED=true` in `.env`)
+5. Optional: set `hindsightAutoRecall: true` to inject recall results into the system prompt
+
 ---
 
 ## HiveMind

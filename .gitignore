@@ -41,3 +41,6 @@ discord-signals.json
 
 # Claude Code runtime lock
 .claude/scheduled_tasks.lock
+
+# Hindsight persisted data (mounted into the Docker container)
+.hindsight-data/

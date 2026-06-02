@@ -1111,6 +1111,104 @@ Blacklisted tokens are filtered BEFORE the LLM even sees pool candidates.`,
       }
     }
   },
+
+  // ─── Hindsight memory tools ───────────────────────────────
+  // Hindsight is a biomimetic memory service that runs separately
+  // (Docker container, port 8888). When enabled in config, every
+  // closed position, pool fact, and strategy is auto-retained;
+  // these tools let you query the memory layer directly.
+  {
+    type: "function",
+    function: {
+      name: "recall_memory",
+      description: `Search the Hindsight memory layer for information relevant to a natural-language query.
+Returns memories retrieved via 4 parallel strategies: semantic vector search, BM25 keyword, graph (entity/temporal/causal links), and temporal filtering. Results are fused via reciprocal rank fusion and cross-encoder reranked.
+
+Use this when you need context that isn't in the current system prompt — past lessons about a similar setup, pool history for a specific address, prior reflections on a strategy, etc. The memory is organized into banks:
+  - lessons:     closed-position rules and outcomes
+  - pools:       per-pool facts and deploy history
+  - strategies:  LP strategy library
+  - reflections: mental models derived from past experience
+
+If Hindsight is disabled or unreachable, returns an empty list — the agent keeps using local JSON files.`,
+      parameters: {
+        type: "object",
+        properties: {
+          bank: {
+            type: "string",
+            enum: ["lessons", "pools", "strategies", "reflections"],
+            description: "Which memory bank to search."
+          },
+          query: {
+            type: "string",
+            description: "Natural-language search query."
+          },
+          limit: {
+            type: "number",
+            description: "Max results to return. Default 6."
+          }
+        },
+        required: ["query"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "reflect_on_memory",
+      description: `Deep analysis on the Hindsight memory bank. Uses the reflect operation to derive new insights, mental models, and connections from existing memories — slower than recall but produces higher-level understanding.
+
+Use this for:
+  - Pattern analysis across many past positions ("what distinguishes my winners from losers?")
+  - Synthesizing lessons from scattered facts
+  - Generating actionable rules from raw experience
+
+The reflection is auto-retained to the reflections bank for future recall.`,
+      parameters: {
+        type: "object",
+        properties: {
+          bank: {
+            type: "string",
+            enum: ["lessons", "pools", "strategies", "reflections"],
+            description: "Which memory bank to reflect on."
+          },
+          query: {
+            type: "string",
+            description: "Question or prompt to reflect on. E.g. 'What patterns lead to OOR closes?'"
+          }
+        },
+        required: ["query"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "retain_memory",
+      description: `Store information into the Hindsight memory layer explicitly. Most memory writes happen automatically (on position close, pool deploy, strategy add). Use this tool when you want to retain an observation, hypothesis, or piece of context that wasn't auto-captured.
+
+Hindsight will internally extract entities, relationships, and temporal data from the content.`,
+      parameters: {
+        type: "object",
+        properties: {
+          bank: {
+            type: "string",
+            enum: ["lessons", "pools", "strategies", "reflections"],
+            description: "Which memory bank to write to."
+          },
+          content: {
+            type: "string",
+            description: "Free-text content to remember. Be specific — name the pool, the strategy, the metric, the outcome."
+          },
+          context: {
+            type: "string",
+            description: "Short label describing the context. E.g. 'pool:OOR-pattern', 'hypothesis:high-fee-strategy'."
+          }
+        },
+        required: ["bank", "content"]
+      }
+    }
+  },
 ];
 
 export const tools = toolDefinitions.map((tool) => ({

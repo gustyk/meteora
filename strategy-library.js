@@ -8,6 +8,10 @@
 
 import fs from "fs";
 import { log } from "./logger.js";
+import {
+  isAvailable as hindsightAvailable,
+  retainStrategy as hindsightRetainStrategy,
+} from "./hindsight.js";
 
 const STRATEGY_FILE = "./strategy-library.json";
 
@@ -158,6 +162,11 @@ export function addStrategy({
 
   save(db);
   log("strategy", `Strategy saved: ${name} (${slug})`);
+
+  // Hindsight: retain the strategy to the memory layer (fire-and-forget).
+  if (hindsightAvailable()) {
+    void hindsightRetainStrategy(db.strategies[slug]);
+  }
   return { saved: true, id: slug, name, active: db.active === slug };
 }
 

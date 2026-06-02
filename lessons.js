@@ -11,6 +11,11 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { log } from "./logger.js";
 import { getSharedLessonsForPrompt, pushHiveLesson, pushHivePerformanceEvent } from "./hivemind.js";
+import {
+  isAvailable as hindsightAvailable,
+  retainLesson as hindsightRetainLesson,
+  reflectOnPerformance as hindsightReflect,
+} from "./hindsight.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const USER_CONFIG_PATH = path.join(__dirname, "user-config.json");
@@ -156,6 +161,12 @@ export async function recordPerformance(perf) {
     void pushHiveLesson(lesson);
   }
 
+  // Hindsight: retain the lesson + performance record to the memory layer.
+  // Fire-and-forget — never blocks the close path.
+  if (hindsightAvailable()) {
+    void hindsightRetainLesson(lesson, entry);
+  }
+
   // Update pool-level memory
   if (perf.pool) {
     const { recordPoolDeploy } = await import("./pool-memory.js");
@@ -192,6 +203,24 @@ export async function recordPerformance(perf) {
       const wResult = recalculateWeights(data.performance, config);
       if (wResult.changes.length > 0) {
         log("evolve", `Darwin: adjusted ${wResult.changes.length} signal weight(s)`);
+      }
+    }
+
+    // Hindsight: periodic deep reflection on accumulated performance.
+    // Runs alongside threshold evolution — produces mental models that
+    // surface in future recall() calls.
+    const reflectEvery = config.hindsight?.autoReflectEvery ?? 5;
+    if (hindsightAvailable() && reflectEvery > 0 && data.performance.length % reflectEvery === 0) {
+      try {
+        const reflection = await hindsightReflect({
+          query: "What patterns distinguish winning positions from losing ones? Any actionable rules for screening thresholds or position management?",
+          positions: data.performance.length,
+        });
+        if (reflection) {
+          log("hindsight", `Reflection @ ${data.performance.length} positions: ${reflection.slice(0, 200)}`);
+        }
+      } catch (error) {
+        log("hindsight_warn", `auto-reflect failed: ${error.message}`);
       }
     }
   }
