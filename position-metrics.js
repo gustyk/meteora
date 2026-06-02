@@ -41,12 +41,22 @@ function computeHourSpan(snaps) {
 
 function computePnlVelocity(snaps) {
   if (!snaps || snaps.length < 2) return null;
-  const first = snaps[0];
-  const last = snaps[snaps.length - 1];
-  if (first.pnl_pct == null || last.pnl_pct == null) return null;
-  const hours = computeHourSpan(snaps);
-  if (hours <= 0) return null;
-  return Number(((last.pnl_pct - first.pnl_pct) / hours).toFixed(3));
+  const known = snaps.filter((s) => s.pnl_pct != null && s.ts);
+  if (known.length < 2) return null;
+  const t0 = new Date(known[0].ts).getTime();
+  const points = known.map((s) => ({
+    x: (new Date(s.ts).getTime() - t0) / 3_600_000, // hours since first snap
+    y: Number(s.pnl_pct),
+  }));
+  const n = points.length;
+  const sumX = points.reduce((acc, p) => acc + p.x, 0);
+  const sumY = points.reduce((acc, p) => acc + p.y, 0);
+  const sumXY = points.reduce((acc, p) => acc + p.x * p.y, 0);
+  const sumXX = points.reduce((acc, p) => acc + p.x * p.x, 0);
+  const denom = n * sumXX - sumX * sumX;
+  if (denom === 0) return null;
+  const slope = (n * sumXY - sumX * sumY) / denom;
+  return Number(slope.toFixed(3));
 }
 
 function computeFeeVelocity(snaps) {
