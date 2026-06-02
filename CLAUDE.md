@@ -133,7 +133,7 @@ The system prompt now opens with **lessons + Hindsight recall at the top** (high
 | Role | Temperature | Top-p | Rationale |
 |------|-------------|-------|-----------|
 | `screening` | 0.15 (was 0.373) | 0.9 | Rule application + ranking. Low temp = more deterministic deploy/skip decisions. |
-| `management` | 0.373 (unchanged) | 0.9 | Position management + trade-off reasoning. |
+| `management` | 0.25 (was 0.373) | 0.9 | Position management + trade-off reasoning. Slightly more deterministic than default. |
 | `general` | 0.373 (unchanged) | 0.9 | Chat + interactive. |
 
 Override per role via `screeningTemperature`, `screeningTopP`, etc. in `user-config.json`.
@@ -190,6 +190,123 @@ All three modes are **off by default** — opt-in via `user-config.json`. To ena
 ### Decision-Log Integration
 
 `decision-log.json` now has a `conviction` field. The manager prompt's "RECENT DECISIONS" section shows the last 6 decisions with their conviction scores for cross-cycle trend analysis.
+
+---
+
+## MANAGEMENT Performance Layer
+
+The manager was rebuilt for higher-quality close/claim decisions. All improvements are backward-compatible and gated behind new config keys (default = previous behavior, with new pre-computed data + auto-Sentinel on top).
+
+### Trajectory Metrics (`position-metrics.js`)
+
+For every open position, `computePositionMetrics()` returns a pre-computed bundle:
+
+| Metric | Source | LLM use |
+|--------|--------|---------|
+| `pnl_velocity_per_hour` | PnL drift over last 6 snapshots | Detect yield collapse / healthy trend |
+| `fee_velocity_per_hour` | Fees drift over last 6 snapshots | Detect fee death |
+| `drawdown_from_peak_pct` | `peak_pnl - current_pnl` | Approaching trail trigger? |
+| `time_in_range_pct` | In-range count over last 6 snapshots | OOR majority? |
+| `lifecycle` | `early (<2h)` / `mid (2-24h)` / `late (>24h)` | Different rules per stage |
+| `estimated_close_cost_pct` | `estCloseCostSol / value` | Worth closing for marginal gain? |
+| `hints[]` | auto-aggregated flags | Pre-formatted bullets for LLM |
+
+Metrics are computed for every open position but the LLM is only called when action is needed (existing STAY-skip optimization preserved).
+
+### Auto-Sentinel (`index.js` runManagementCycle)
+
+Sentinel is now auto-triggered at the start of every management cycle for **action positions only** (saves RPC). The LLM goal gets pre-evaluated `regime`, `P_exit`, `IL`, and `recommendation` for each. The LLM can skip the `sentinel_analyze` tool call unless it needs a fresh eval (>5 min old).
+
+Cooldown still gates rebalances (`config.sentinel.control.rebalanceCooldownSec` = 300s default). Emergency override (`|IL| ≥ 15%`) bypasses cooldown and forces `close_position`.
+
+### Comparable Alternative Yield (`index.js`)
+
+The top screener candidate's fee/TVL is fetched at the start of the management cycle and injected into the LLM goal as `COMPARABLE ALTERNATIVE`. Helps the LLM weigh "stay vs close-to-redeploy" with real opportunity-cost data.
+
+Disable via `management.comparableAltEnabled: false`.
+
+### JS-Side Instruction Parser (`position-metrics.js`)
+
+Simple instructions are now parsed in JavaScript before reaching the LLM:
+
+| Pattern | Parsed type |
+|---------|-------------|
+| `close at 5% profit`, `hold until +3%` | `TAKE_PROFIT` |
+| `close if down 10%`, `stop loss 5%` | `STOP_LOSS` |
+| `close if pnl < -5%`, `close if pnl > 5%` | `TAKE_PROFIT` / `STOP_LOSS` |
+| `close after 2h`, `exit after 30m` | `TIME_LIMIT` |
+| anything else | unparseable → LLM evaluates |
+
+When parsed + met → automatic `CLOSE` action. When parsed + not met → automatic `STAY` (skips LLM entirely). When unparseable → falls through to LLM with the raw instruction.
+
+### Multi-Position Portfolio View (`index.js`)
+
+LLM gets a `PORTFOLIO VIEW` block showing weakest/best positions, total exposure, and weighted PnL. Enables rebalance-style thinking: "weakest is -8%, best is +5% — close weakest and let best run."
+
+### Drawdown Guard (`state.js` + `position-metrics.js`)
+
+If `drawdown_from_peak / peak_pnl >= drawdownGuardPct` (default 50%), the position is marked with `INSTRUCTION: drawdown_guard` and routed to the LLM with full context. A "force exit" mode (`drawdownGuardForceExit: true`) bypasses LLM and deterministically closes — reserved slot, NOT YET IMPLEMENTED.
+
+### Closed-Position Feedback (`index.js` buildClosedFeedback)
+
+LLM gets a `RECENT CLOSES` block showing the last 3 closed positions with PnL, fees, and reason. Enables the LLM to learn from its own recent actions. Pulls from `lessons.json` performance log.
+
+### Briefing Improvement (`briefing.js`)
+
+Daily Telegram briefing now shows:
+- 24h + 7d PnL, fees, win rate
+- Close reason breakdown (e.g. `low yield=3, oor=1`)
+- Sentinel avg reward (24h + 7d)
+- Active pool cooldowns
+
+### New Config Keys (`config.js`)
+
+| Key | Default | Purpose |
+|-----|---------|---------|
+| `management.estCloseCostSol` | 0.005 | Estimated close + swap gas in SOL |
+| `management.minCloseWorthinessSol` | 0.05 | Min pnl_gain - close_cost to consider close |
+| `management.drawdownGuardPct` | 50 | % of peak PnL that triggers soft-stop |
+| `management.autoSentinelEnabled` | true | Auto-run Sentinel for action positions |
+| `management.comparableAltEnabled` | true | Fetch top candidate fee/TVL as alt yield |
+| `management.drawdownGuardForceExit` | false | Bypass LLM on drawdown guard (reserved) |
+| `llm.management.temperature` | 0.25 (was 0.373) | Slightly more deterministic |
+
+### New Tool: `get_position_health`
+
+One-call comprehensive snapshot combining trajectory + Sentinel + hints. Saves 2-3 tool calls per position.
+
+Tool input: `{ position_address, pool_address }`. Returns:
+- Live position data
+- Trajectory metrics + hints
+- Sentinel pre-eval (regime, P_exit, IL, recommendation)
+- Aggregated action hints
+
+Available in `MANAGER_TOOLS`, `INTENT_TOOLS.close`, `INTENT_TOOLS.claim`, `INTENT_TOOLS.sentinel`, `INTENT_TOOLS.positions`.
+
+### Better Swap (`tools/wallet.js`)
+
+`swap_token` now accepts `slippageBps` parameter (default 50 = 0.5%). Returns `slippage_bps` and `price_impact_pct` in the response. For low-liquidity base tokens, LLM can pass 100-150 bps.
+
+### Prompt Restructure (`prompt.js` MANAGER)
+
+The MANAGER section now opens with a **DECISION FRAMEWORK** — a 7-step walk-through:
+1. Is the alert already triggered? (close/claim rule)
+2. Is the instruction met? (JS-parsed or LLM-eval)
+3. Trajectory check (yield collapse + drawdown)
+4. Close worthiness (cost vs gain)
+5. Sentinel check (auto-eval provided)
+6. Comparable alternative (stay vs redeploy)
+7. Default: HOLD
+
+Then `BEHAVIORAL CORE` (patience, gas efficiency, after-close swap, slippage, Sentinel, untrusted data).
+
+### Backward Compatibility
+
+All new keys default to previous behavior. Set `management.autoSentinelEnabled: false` to disable auto-Sentinel. Set `management.comparableAltEnabled: false` to disable alt yield. Temperature change is opt-in via `managementTemperature` in `user-config.json`.
+
+### Smoke Test
+
+`node test_position_metrics.mjs` runs 19 tests covering parseInstruction, evaluateInstruction, and computePositionMetrics. All pass.
 
 ---
 
@@ -378,3 +495,5 @@ Agent Meridian HiveMind sync is handled by `hivemind.js`. It uses built-in Agent
 - `get_wallet_positions` tool (dlmm.js) is in definitions.js but not in MANAGER_TOOLS or SCREENER_TOOLS — only available in GENERAL role.
 - `runScreener()` self-consistency / tournament / two-stage modes are opt-in. Default behavior unchanged.
 - Conviction enforcement is LOG-ONLY (analytics) — the deploy has already happened by the time we parse the score. The agent is supposed to self-enforce via the MANDATORY PRE-DEPLOY SELF-CHECK section in the prompt.
+- `management.drawdownGuardForceExit` is reserved (NOT YET IMPLEMENTED). Currently drawdown guard is a soft hint to LLM, not a deterministic exit.
+- `fee_velocity_per_hour` uses `unclaimed_fees_usd` snapshot diff, which conflates claim events with organic fee growth. Use as a noisy indicator only, not as a hard signal.

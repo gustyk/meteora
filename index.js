@@ -3,6 +3,7 @@ import cron from "node-cron";
 import readline from "readline";
 import path from "path";
 import { fileURLToPath } from "url";
+import fs from "fs";
 import { agentLoop, extractConvictionScore, runScreener } from "./agent.js";
 import { log } from "./logger.js";
 import { getMyPositions, closePosition, getActiveBin } from "./tools/dlmm.js";
@@ -36,6 +37,8 @@ import { getWeightsSummary } from "./signal-weights.js";
 import { bootstrapHiveMind, ensureAgentId, getHiveMindPullMode, isHiveMindEnabled, pullHiveMindLessons, pullHiveMindPresets, registerHiveMindAgent, startHiveMindBackgroundSync } from "./hivemind.js";
 import { bootstrap as bootstrapHindsight } from "./hindsight.js";
 import { appendDecision } from "./decision-log.js";
+import { computePositionMetrics, parseInstruction, evaluateInstruction } from "./position-metrics.js";
+import { runSentinelEvaluation } from "./tools/sentinel.js";
 
 const entrypointPath = process.env.pm_exec_path || process.argv[1];
 const isMain = entrypointPath
@@ -272,62 +275,235 @@ export async function runManagementCycle({ silent = false } = {}) {
       }
     }
 
-    // ── Deterministic rule checks (no LLM) ──────────────────────────
-    // action: CLOSE | CLAIM | STAY | INSTRUCTION (needs LLM)
+    // ═══════════════════════════════════════════
+    //  MANAGEMENT PERFORMANCE LAYER
+    //  Per-position enrichment: metrics, instruction-parse, drawdown guard
+    // ═══════════════════════════════════════════
+    const enrichedData = new Map();
+    for (const p of positionData) {
+      const tracked = getTrackedPosition(p.position) || {};
+      // Trajectory: PnL velocity, fee velocity, drawdown, time-in-range, lifecycle, close cost
+      const metrics = computePositionMetrics({
+        pool_address: p.pool,
+        position_address: p.position,
+        positionData: p,
+        positionRecord: tracked,
+        config,
+        estCloseCostSol: config.management.estCloseCostSol ?? 0.005,
+      });
+
+      // JS-side instruction parser
+      let instructionEval = null;
+      if (p.instruction) {
+        const parsed = parseInstruction(p.instruction);
+        instructionEval = evaluateInstruction({
+          parsed,
+          currentPnl: p.pnl_pct,
+          ageMinutes: metrics.age_minutes,
+        });
+        instructionEval.parsed = parsed;
+        instructionEval.raw = p.instruction;
+      }
+
+      // Drawdown guard (#15): if drawdown from peak exceeds X% of peak PnL,
+      // mark as soft-stop. We compute "drawdown as % of peak" not absolute.
+      let drawdownGuardFired = false;
+      let drawdownGuardReason = null;
+      if (
+        metrics.drawdown_from_peak_pct != null &&
+        tracked.peak_pnl_pct != null &&
+        tracked.peak_pnl_pct > 0 &&
+        config.management.drawdownGuardPct
+      ) {
+        const drawdownAsPctOfPeak = (metrics.drawdown_from_peak_pct / tracked.peak_pnl_pct) * 100;
+        if (drawdownAsPctOfPeak >= config.management.drawdownGuardPct) {
+          drawdownGuardFired = true;
+          drawdownGuardReason = `drawdown ${drawdownAsPctOfPeak.toFixed(1)}% of peak (${tracked.peak_pnl_pct.toFixed(2)}% → ${(p.pnl_pct ?? 0).toFixed(2)}%, threshold ${config.management.drawdownGuardPct}%)`;
+        }
+      }
+
+      enrichedData.set(p.position, { metrics, instructionEval, drawdownGuardFired, drawdownGuardReason, tracked });
+    }
+
+    // ═══════════════════════════════════════════
+    //  DETERMINISTIC ACTION MAP (no LLM)
+    // ═══════════════════════════════════════════
     const actionMap = new Map();
     for (const p of positionData) {
-      // Hard exit — highest priority
+      const enriched = enrichedData.get(p.position) || {};
+      // 1. Hard exit (trailing TP, OOR, etc.) — highest priority
       if (exitMap.has(p.position)) {
         actionMap.set(p.position, { action: "CLOSE", rule: "exit", reason: exitMap.get(p.position) });
         continue;
       }
-      // Instruction-set — pass to LLM, can't parse in JS
-      if (p.instruction) {
-        actionMap.set(p.position, { action: "INSTRUCTION" });
+      // 2. JS-parsed instruction that is met → close
+      if (enriched.instructionEval && enriched.instructionEval.met === true) {
+        actionMap.set(p.position, { action: "CLOSE", rule: "instruction_parsed", reason: enriched.instructionEval.reason });
         continue;
       }
-
+      // 3. JS-parsed instruction that is NOT met → hold silently, skip LLM
+      if (enriched.instructionEval && enriched.instructionEval.met === false) {
+        actionMap.set(p.position, { action: "STAY" });
+        continue;
+      }
+      // 4. Drawdown guard (#15) — soft-stop hint for LLM
+      if (enriched.drawdownGuardFired) {
+        actionMap.set(p.position, { action: "INSTRUCTION", rule: "drawdown_guard", reason: enriched.drawdownGuardReason });
+        continue;
+      }
+      // 5. Trajectory alert: yield collapse + drawdown (#1)
+      if (
+        enriched.metrics?.pnl_velocity_per_hour != null && enriched.metrics.pnl_velocity_per_hour < -3 &&
+        enriched.metrics?.drawdown_from_peak_pct != null &&
+        enriched.metrics.drawdown_from_peak_pct >= (config.management.trailingDropPct ?? 1.5) * 0.7
+      ) {
+        actionMap.set(p.position, { action: "INSTRUCTION", rule: "metrics_alert", reason: `yield_collapse: pnl_vel ${enriched.metrics.pnl_velocity_per_hour.toFixed(2)}%/hr + drawdown ${enriched.metrics.drawdown_from_peak_pct.toFixed(2)}%` });
+        continue;
+      }
+      // 6. Fee velocity negative + OOR majority
+      if (
+        enriched.metrics?.fee_velocity_per_hour != null && enriched.metrics.fee_velocity_per_hour < 0 &&
+        enriched.metrics?.time_in_range_pct != null && enriched.metrics.time_in_range_pct < 50
+      ) {
+        actionMap.set(p.position, { action: "INSTRUCTION", rule: "metrics_alert", reason: `dying_position: fee_vel negative + OOR ${enriched.metrics.time_in_range_pct}%` });
+        continue;
+      }
+      // 7. Deterministic close rules (stop loss, take profit, OOR wait, low yield, pumped above)
       const closeRule = getDeterministicCloseRule(p, config.management);
       if (closeRule) {
         actionMap.set(p.position, closeRule);
         continue;
       }
-      // Claim rule
+      // 8. Unparseable instruction (e.g. "watch for narrative shift") → defer to LLM
+      if (p.instruction) {
+        actionMap.set(p.position, { action: "INSTRUCTION" });
+        continue;
+      }
+      // 9. Claim rule
       if ((p.unclaimed_fees_usd ?? 0) >= config.management.minClaimAmount) {
         actionMap.set(p.position, { action: "CLAIM" });
         continue;
       }
+      // 10. STAY (skip LLM)
       actionMap.set(p.position, { action: "STAY" });
     }
 
-    // ── Build JS report ──────────────────────────────────────────────
+    // ═══════════════════════════════════════════
+    //  AUTO-SENTINEL (#2): run on action positions only (saves RPC)
+    // ═══════════════════════════════════════════
+    const sentinelResults = new Map();
+    if (config.management.autoSentinelEnabled) {
+      const actionPositionsForSentinel = positionData.filter((p) => {
+        const a = actionMap.get(p.position);
+        return a && a.action !== "STAY";
+      });
+      if (actionPositionsForSentinel.length > 0) {
+        log("cron", `Auto-Sentinel: running for ${actionPositionsForSentinel.length} action position(s)`);
+        await Promise.all(actionPositionsForSentinel.map(async (p) => {
+          const enriched = enrichedData.get(p.position) || {};
+          const tracked = enriched.tracked || {};
+          try {
+            const result = await runSentinelEvaluation({
+              position: {
+                position_address: p.position,
+                pool_address: p.pool,
+                initial_price: tracked.initial_price || null,
+                lower_bin_id: p.lower_bin ?? tracked.bin_range?.lowerBinId ?? null,
+                upper_bin_id: p.upper_bin ?? tracked.bin_range?.upperBinId ?? null,
+                bin_step: p.bin_step ?? tracked.bin_step ?? null,
+                last_sentinel_eval: tracked.last_sentinel_eval,
+                strategy: tracked.strategy,
+              },
+              volatility: tracked.volatility ?? null,
+            });
+            sentinelResults.set(p.position, result);
+            // Persist last_sentinel_eval for cooldown tracking
+            tracked.last_sentinel_eval = new Date().toISOString();
+          } catch (e) {
+            log("sentinel_warn", `Auto-Sentinel failed for ${p.position}: ${e.message}`);
+          }
+        }));
+      }
+    }
+
+    // ═══════════════════════════════════════════
+    //  COMPARABLE ALTERNATIVE YIELD (#4)
+    // ═══════════════════════════════════════════
+    let comparableAlt = null;
+    if (config.management.comparableAltEnabled) {
+      try {
+        const topCand = await getTopCandidates({ limit: 1 }).catch(() => null);
+        const topPool = topCand?.candidates?.[0] || topCand?.pools?.[0];
+        if (topPool) {
+          comparableAlt = {
+            name: topPool.name || "unknown",
+            pool_address: topPool.pool || topPool.pool_address,
+            fee_active_tvl_ratio: Number(topPool.fee_active_tvl_ratio ?? 0),
+            volume_window: Number(topPool.volume_window ?? 0),
+            tvl: Number(topPool.active_tvl ?? topPool.tvl ?? 0),
+            organic_score: Number(topPool.organic_score ?? 0),
+            mcap: Number(topPool.mcap ?? 0),
+          };
+        }
+      } catch (e) {
+        log("cron_warn", `Comparable alt fetch failed: ${e.message}`);
+      }
+    }
+
+    // ═══════════════════════════════════════════
+    //  BUILD JS REPORT
+    // ═══════════════════════════════════════════
     const totalValue = positionData.reduce((s, p) => s + (p.total_value_usd ?? 0), 0);
     const totalUnclaimed = positionData.reduce((s, p) => s + (p.unclaimed_fees_usd ?? 0), 0);
 
     const reportLines = positionData.map((p) => {
       const act = actionMap.get(p.position);
+      const enriched = enrichedData.get(p.position) || {};
+      const m = enriched.metrics || {};
       const inRange = p.in_range ? "🟢 IN" : `🔴 OOR ${p.minutes_out_of_range ?? 0}m`;
       const val = config.management.solMode ? `◎${p.total_value_usd ?? "?"}` : `$${p.total_value_usd ?? "?"}`;
       const unclaimed = config.management.solMode ? `◎${p.unclaimed_fees_usd ?? "?"}` : `$${p.unclaimed_fees_usd ?? "?"}`;
       const statusLabel = act.action === "INSTRUCTION" ? "HOLD (instruction)" : act.action;
       let line = `**${p.pair}** | Age: ${p.age_minutes ?? "?"}m | Val: ${val} | Unclaimed: ${unclaimed} | PnL: ${p.pnl_pct ?? "?"}% | Yield: ${p.fee_per_tvl_24h ?? "?"}% | ${inRange} | ${statusLabel}`;
       if (p.instruction) line += `\nNote: "${p.instruction}"`;
+      if (m.lifecycle) line += ` | ${m.lifecycle}`;
+      if (m.drawdown_from_peak_pct != null && m.drawdown_from_peak_pct > 0) {
+        line += ` | DD-from-peak: ${m.drawdown_from_peak_pct.toFixed(2)}%`;
+      }
+      if (m.pnl_velocity_per_hour != null) {
+        line += ` | pnl_vel: ${m.pnl_velocity_per_hour >= 0 ? "+" : ""}${m.pnl_velocity_per_hour.toFixed(2)}%/hr`;
+      }
       if (act.action === "CLOSE" && act.rule === "exit") line += `\n⚡ Trailing TP: ${act.reason}`;
-      if (act.action === "CLOSE" && act.rule && act.rule !== "exit") line += `\nRule ${act.rule}: ${act.reason}`;
+      if (act.action === "CLOSE" && act.rule === "instruction_parsed") line += `\n✅ Instruction met: ${act.reason}`;
+      if (act.action === "CLOSE" && act.rule && !["exit", "instruction_parsed"].includes(act.rule)) line += `\nRule ${act.rule}: ${act.reason}`;
+      if (act.action === "INSTRUCTION" && act.rule === "drawdown_guard") line += `\n⚠️ Drawdown guard: ${act.reason}`;
+      if (act.action === "INSTRUCTION" && act.rule === "metrics_alert") line += `\n📉 Metrics alert: ${act.reason}`;
       if (act.action === "CLAIM") line += `\n→ Claiming fees`;
+      if (m.hints?.length > 0) {
+        line += `\n💡 ${m.hints.join("; ")}`;
+      }
       return line;
     });
 
     const needsAction = [...actionMap.values()].filter(a => a.action !== "STAY");
     const actionSummary = needsAction.length > 0
-      ? needsAction.map(a => a.action === "INSTRUCTION" ? "EVAL instruction" : `${a.action}${a.reason ? ` (${a.reason})` : ""}`).join(", ")
+      ? needsAction.map(a => {
+        if (a.action === "INSTRUCTION") {
+          if (a.rule === "drawdown_guard") return "DRAWDOWN_GUARD";
+          if (a.rule === "metrics_alert") return "METRICS_ALERT";
+          return "EVAL instruction";
+        }
+        return `${a.action}${a.reason ? ` (${a.reason})` : ""}`;
+      }).join(", ")
       : "no action";
 
     const cur = config.management.solMode ? "◎" : "$";
     mgmtReport = reportLines.join("\n\n") +
       `\n\nSummary: 💼 ${positions.length} positions | ${cur}${totalValue.toFixed(4)} | fees: ${cur}${totalUnclaimed.toFixed(4)} | ${actionSummary}`;
 
-    // ── Call LLM only if action needed ──────────────────────────────
+    // ═══════════════════════════════════════════
+    //  CALL LLM ONLY IF ACTION NEEDED
+    // ═══════════════════════════════════════════
     const actionPositions = positionData.filter(p => {
       const a = actionMap.get(p.position);
       return a.action !== "STAY";
@@ -336,32 +512,77 @@ export async function runManagementCycle({ silent = false } = {}) {
     if (actionPositions.length > 0) {
       log("cron", `Management: ${actionPositions.length} action(s) needed — invoking LLM [model: ${config.llm.managementModel}]`);
 
+      // Multi-position portfolio view (#9)
+      const portfolioView = buildPortfolioView(positionData, enrichedData, actionMap);
+
+      // Build per-position blocks with all pre-computed data
       const actionBlocks = actionPositions.map((p) => {
         const act = actionMap.get(p.position);
-        return [
+        const enriched = enrichedData.get(p.position) || {};
+        const m = enriched.metrics || {};
+        const sentinel = sentinelResults.get(p.position);
+        const lines = [
           `POSITION: ${p.pair} (${p.position})`,
           `  pool: ${p.pool}`,
-          `  action: ${act.action}${act.rule && act.rule !== "exit" ? ` — Rule ${act.rule}: ${act.reason}` : ""}${act.rule === "exit" ? ` — ⚡ Trailing TP: ${act.reason}` : ""}`,
+          `  action: ${act.action}${act.rule === "exit" ? ` — ⚡ ${act.reason}` : act.rule === "instruction_parsed" ? ` — ✅ ${act.reason}` : act.rule === "drawdown_guard" ? ` — ⚠️ ${act.reason}` : act.rule === "metrics_alert" ? ` — 📉 ${act.reason}` : act.rule && act.rule !== "exit" ? ` — Rule ${act.rule}: ${act.reason}` : ""}`,
           `  pnl_pct: ${p.pnl_pct}% | unclaimed_fees: ${cur}${p.unclaimed_fees_usd} | value: ${cur}${p.total_value_usd} | fee_per_tvl_24h: ${p.fee_per_tvl_24h ?? "?"}%`,
           `  bins: lower=${p.lower_bin} upper=${p.upper_bin} active=${p.active_bin} | oor_minutes: ${p.minutes_out_of_range ?? 0}`,
-          p.instruction ? `  instruction: "${p.instruction}"` : null,
-        ].filter(Boolean).join("\n");
+        ];
+        // Pre-computed trajectory
+        if (m.lifecycle) lines.push(`  lifecycle: ${m.lifecycle} (age ${m.age_minutes ?? "?"}m)`);
+        if (m.pnl_velocity_per_hour != null) lines.push(`  pnl_velocity: ${m.pnl_velocity_per_hour >= 0 ? "+" : ""}${m.pnl_velocity_per_hour.toFixed(2)}%/hr (over last ${m.snapshot_count} cycles)`);
+        if (m.fee_velocity_per_hour != null) lines.push(`  fee_velocity: ${m.fee_velocity_per_hour >= 0 ? "+" : ""}$${m.fee_velocity_per_hour.toFixed(4)}/hr`);
+        if (m.drawdown_from_peak_pct != null) lines.push(`  drawdown_from_peak: ${m.drawdown_from_peak_pct.toFixed(2)}%`);
+        if (m.time_in_range_pct != null) lines.push(`  time_in_range: ${m.time_in_range_pct}%`);
+        if (m.estimated_close_cost_pct != null) lines.push(`  close_cost: ${m.estimated_close_cost_pct.toFixed(2)}% of value (~$${m.estimated_close_cost_sol} SOL)`);
+        if (m.hints?.length > 0) lines.push(`  hints: ${m.hints.join("; ")}`);
+
+        // Instruction
+        if (p.instruction) {
+          lines.push(`  instruction: "${p.instruction}"`);
+          if (enriched.instructionEval?.met === true) lines.push(`  INSTRUCTION_PARSED: met (${enriched.instructionEval.reason})`);
+          else if (enriched.instructionEval?.met === false) lines.push(`  INSTRUCTION_PARSED: not met (${enriched.instructionEval.reason})`);
+          else if (enriched.instructionEval) lines.push(`  INSTRUCTION_PARSED: unparseable — evaluate manually`);
+        }
+
+        // Auto-Sentinel pre-eval
+        if (sentinel) {
+          lines.push(`  SENTINEL_PRE_EVAL: regime=${sentinel.regime}, P_exit=${sentinel.pExit != null ? (sentinel.pExit * 100).toFixed(1) + "%" : "n/a"}, IL=${sentinel.ilPct != null ? sentinel.ilPct.toFixed(2) + "%" : "n/a"}`);
+          if (sentinel.recommendation) {
+            lines.push(`    recommendation: ${sentinel.recommendation.action} → ${sentinel.recommendation.targetShape || "—"} (cooldownOk=${sentinel.recommendation.cooldownOk})`);
+            lines.push(`    reason: ${sentinel.recommendation.reason}`);
+          }
+        }
+        return lines.filter(Boolean).join("\n");
       }).join("\n\n");
 
-      const { content } = await agentLoop(`
-MANAGEMENT ACTION REQUIRED — ${actionPositions.length} position(s)
+      // Comparable alt block
+      const altBlock = comparableAlt ? `COMPARABLE ALTERNATIVE: top candidate "${comparableAlt.name}" has fee/TVL ${comparableAlt.fee_active_tvl_ratio.toFixed(2)}%, volume ${cur}${comparableAlt.volume_window.toFixed(0)}, organic ${comparableAlt.organic_score}. Use to weigh stay-vs-redeploy.` : null;
 
-${actionBlocks}
+      // Recent closed positions for close feedback (#13)
+      const closedFeedback = buildClosedFeedback(positionData, 3);
 
-RULES:
-- CLOSE: call close_position only — it handles fee claiming internally, do NOT call claim_fees first
-- CLAIM: call claim_fees with position address
-- INSTRUCTION: evaluate the instruction condition. If met → close_position. If not → HOLD, do nothing.
-- ⚡ exit alerts: close immediately, no exceptions
+      const goalText = [
+        `MANAGEMENT ACTION REQUIRED — ${actionPositions.length} position(s)`,
+        "",
+        actionBlocks,
+        altBlock,
+        closedFeedback,
+        "",
+        portfolioView,
+        "",
+        "RULES:",
+        "- CLOSE rules (trailing TP / stop loss / OOR / low yield / instruction_parsed): call close_position — it handles fee claiming internally, do NOT call claim_fees first.",
+        "- CLAIM: call claim_fees with position address.",
+        "- INSTRUCTION_PARSED met: call close_position. (Already pre-evaluated.)",
+        "- INSTRUCTION (unparseable or metrics alert / drawdown guard): evaluate the condition. If action warranted → close_position. If not → HOLD, do nothing.",
+        "- SENTINEL emergency (|IL|≥" + (config.sentinel?.thresholds?.ilPctEmergency ?? 15) + "%): call close_position immediately.",
+        "- After close, swap_token is MANDATORY for any base token worth >= $0.10 (check auto_swap_note from close result).",
+        "Do NOT re-evaluate CLOSE/CLAIM — rules already applied. Just execute.",
+        "After executing, write a brief one-line result per position.",
+      ].filter(Boolean).join("\n");
 
-Execute the required actions. Do NOT re-evaluate CLOSE/CLAIM — rules already applied. Just execute.
-After executing, write a brief one-line result per position.
-      `, config.llm.maxSteps, [], "MANAGER", config.llm.managementModel, 2048, {
+      const { content } = await agentLoop(goalText, config.llm.maxSteps, [], "MANAGER", config.llm.managementModel, 2048, {
         onToolStart: async ({ name }) => { await liveMessage?.toolStart(name); },
         onToolFinish: async ({ name, result, success }) => { await liveMessage?.toolFinish(name, result, success); },
       });
@@ -397,6 +618,56 @@ After executing, write a brief one-line result per position.
     }
   }
   return mgmtReport;
+}
+
+// ─── Portfolio view + closed feedback helpers (#9, #13) ─────────
+
+/**
+ * Build a multi-position portfolio summary so the LLM can see
+ * weakest/best/total context. Helps rebalance decisions.
+ */
+function buildPortfolioView(positionData, enrichedData, actionMap) {
+  if (!positionData || positionData.length === 0) return null;
+  const ranked = [...positionData]
+    .map((p) => ({
+      pair: p.pair,
+      pnl_pct: Number(p.pnl_pct ?? 0),
+      action: actionMap.get(p.position)?.action || "STAY",
+      drawdown: enrichedData.get(p.position)?.metrics?.drawdown_from_peak_pct ?? 0,
+      lifecycle: enrichedData.get(p.position)?.metrics?.lifecycle ?? "—",
+    }))
+    .sort((a, b) => a.pnl_pct - b.pnl_pct);
+  const best = ranked[ranked.length - 1];
+  const worst = ranked[0];
+  const totalValue = positionData.reduce((s, p) => s + (p.total_value_usd ?? 0), 0);
+  const totalPnl = positionData.reduce((s, p) => s + (p.total_value_usd ?? 0) * (Number(p.pnl_pct ?? 0) / 100), 0);
+  return [
+    "PORTFOLIO VIEW:",
+    `- ${positionData.length} positions, total ~$${totalValue.toFixed(2)}, weighted PnL ${totalPnl >= 0 ? "+" : ""}$${totalPnl.toFixed(2)}`,
+    `- Weakest: ${worst.pair} (${worst.pnl_pct.toFixed(2)}% PnL, DD ${worst.drawdown.toFixed(2)}%, ${worst.lifecycle}) — action=${worst.action}`,
+    `- Best: ${best.pair} (${best.pnl_pct.toFixed(2)}% PnL, ${best.lifecycle}) — action=${best.action}`,
+    `- Use weakest vs best to weigh "rebalance by closing worst" opportunities.`,
+  ].join("\n");
+}
+
+/**
+ * Build a "recent closes" feedback block so the LLM can see the
+ * outcomes of its own recent actions (#13). Reads from lessons.json.
+ */
+function buildClosedFeedback(positionData, limit = 3) {
+  try {
+    if (!fs.existsSync("./lessons.json")) return null;
+    const data = JSON.parse(fs.readFileSync("./lessons.json", "utf8"));
+    const perf = (data.performance || []).slice(-limit);
+    if (perf.length === 0) return null;
+    const lines = ["RECENT CLOSES (last-cycle feedback):"];
+    for (const r of perf) {
+      lines.push(`- ${r.pool_name || r.pool?.slice(0, 8)}: PnL ${r.pnl_pct?.toFixed(2)}%, fees $${r.fees_earned_usd?.toFixed(2) || "?"}, reason: ${r.close_reason || "?"}`);
+    }
+    return lines.join("\n");
+  } catch {
+    return null;
+  }
 }
 
 export async function runScreeningCycle({ silent = false } = {}) {

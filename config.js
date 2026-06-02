@@ -122,6 +122,26 @@ export const config = {
     pnlSanityMaxDiffPct:   u.pnlSanityMaxDiffPct   ?? 5,    // max allowed diff between reported and derived pnl % before ignoring a tick
     // SOL mode — positions, PnL, and balances reported in SOL instead of USD
     solMode:               u.solMode               ?? false,
+    // ─── MANAGEMENT PERFORMANCE LAYER (16-item overhaul) ───
+    // Estimated SOL cost of close + auto-swap (gas + slippage). Used for
+    // "close_cost_pct_of_value" hints so the LLM doesn't close for marginal gain.
+    estCloseCostSol:       u.estCloseCostSol       ?? 0.005,
+    // Min close worthiness — refuse to even consider close if value × (pct
+    // gain - close_cost_pct) < this. Default 0.05 SOL. Set to 0 to disable.
+    minCloseWorthinessSol: u.minCloseWorthinessSol ?? 0.05,
+    // Drawdown guard: if drawdown from peak exceeds this % AND PnL has been
+    // negative for the last 3 snapshots, mark as soft-stop (INSTRUCTION hint).
+    drawdownGuardPct:      u.drawdownGuardPct      ?? 50, // % of peak pnl lost
+    // Auto-run Sentinel at the start of every management cycle and inject
+    // regime/P_exit/IL into the LLM goal. Saves a tool call, ensures IL
+    // mitigation is always considered.
+    autoSentinelEnabled:   u.autoSentinelEnabled   ?? true,
+    // Include top screener candidate's fee/TVL ratio as "alternative yield"
+    // baseline. Helps LLM decide stay-vs-close-to-redeploy.
+    comparableAltEnabled:  u.comparableAltEnabled  ?? true,
+    // In drawdown scenarios, force a deterministic partial close instead of
+    // trusting the LLM's judgment. (NOT YET IMPLEMENTED — reserved slot.)
+    drawdownGuardForceExit:u.drawdownGuardForceExit?? false,
   },
 
   // ─── Strategy Mapping ───────────────────
@@ -178,7 +198,7 @@ export const config = {
       tournamentOpponent: u.screeningTournamentOpponent ?? null,
     },
     management: {
-      temperature:     u.managementTemperature     ?? 0.373,
+      temperature:     u.managementTemperature     ?? 0.25,
       topP:            u.managementTopP            ?? 0.9,
       presencePenalty: u.managementPresencePenalty ?? 0,
       frequencyPenalty:u.managementFrequencyPenalty?? 0,

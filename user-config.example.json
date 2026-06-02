@@ -64,6 +64,14 @@
   "pnlSanityMaxDiffPct": 5,
   "solMode": false,
 
+  "_comment_management_perf_layer": "─── MANAGEMENT PERFORMANCE LAYER (16-item overhaul) ───",
+  "estCloseCostSol": 0.005,
+  "minCloseWorthinessSol": 0.05,
+  "drawdownGuardPct": 50,
+  "autoSentinelEnabled": true,
+  "comparableAltEnabled": true,
+  "drawdownGuardForceExit": false,
+
   "managementIntervalMin": 10,
   "screeningIntervalMin": 30,
   "healthCheckIntervalMin": 60,
@@ -85,7 +93,7 @@
   "screeningSelfConsistencyN": 1,
   "screeningTournamentEnabled": false,
   "screeningTournamentOpponent": null,
-  "managementTemperature": 0.373,
+  "managementTemperature": 0.25,
   "managementTopP": 0.9,
   "generalTemperature": 0.373,
   "generalTopP": 0.9,

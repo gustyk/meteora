@@ -146,6 +146,7 @@ export async function swapToken({
   input_mint,
   output_mint,
   amount,
+  slippageBps = 50, // default 0.5% — Jupiter's default
 }) {
   input_mint  = normalizeMint(input_mint);
   output_mint = normalizeMint(output_mint);
@@ -153,13 +154,13 @@ export async function swapToken({
   if (process.env.DRY_RUN === "true") {
     return {
       dry_run: true,
-      would_swap: { input_mint, output_mint, amount },
+      would_swap: { input_mint, output_mint, amount, slippageBps },
       message: "DRY RUN — no transaction sent",
     };
   }
 
   try {
-    log("swap", `${amount} of ${input_mint} → ${output_mint}`);
+    log("swap", `${amount} of ${input_mint} → ${output_mint} (slippageBps=${slippageBps})`);
     const wallet = getWallet();
     const connection = getConnection();
 
@@ -177,6 +178,7 @@ export async function swapToken({
       outputMint: output_mint,
       amount: amountStr,
       taker: wallet.publicKey.toString(),
+      slippageBps: String(slippageBps),
     });
     const referralParams = getJupiterReferralParams();
     if (referralParams) {
@@ -239,6 +241,8 @@ export async function swapToken({
       output_mint,
       amount_in: result.inputAmountResult,
       amount_out: result.outputAmountResult,
+      slippage_bps: slippageBps,
+      price_impact_pct: order.priceImpactPct ?? null,
       referral_account: referralParams?.referralAccount || null,
       referral_fee_bps_requested: referralParams?.referralFee || 0,
       fee_bps_applied: order.feeBps ?? null,

@@ -4,7 +4,7 @@ import { buildSystemPrompt } from "./prompt.js";
 import { executeTool } from "./tools/executor.js";
 import { tools } from "./tools/definitions.js";
 
-const MANAGER_TOOLS  = new Set(["close_position", "claim_fees", "swap_token", "get_position_pnl", "get_my_positions", "get_wallet_balance", "recall_memory", "reflect_on_memory", "retain_memory", "sentinel_analyze", "sentinel_calculate_reward", "sentinel_classify_regime", "sentinel_calculate_p_exit", "sentinel_calculate_il", "sentinel_get_status", "sentinel_set_weights", "sentinel_set_thresholds", "sentinel_evaluate_closed"]);
+const MANAGER_TOOLS  = new Set(["close_position", "claim_fees", "swap_token", "get_position_pnl", "get_my_positions", "get_wallet_balance", "get_position_health", "recall_memory", "reflect_on_memory", "retain_memory", "sentinel_analyze", "sentinel_calculate_reward", "sentinel_classify_regime", "sentinel_calculate_p_exit", "sentinel_calculate_il", "sentinel_get_status", "sentinel_set_weights", "sentinel_set_thresholds", "sentinel_evaluate_closed"]);
 const SCREENER_TOOLS = new Set(["deploy_position", "get_active_bin", "get_top_candidates", "check_smart_wallets_on_pool", "get_token_holders", "get_token_narrative", "get_token_info", "search_pools", "get_pool_memory", "get_wallet_balance", "get_my_positions", "recall_memory", "reflect_on_memory", "retain_memory"]);
 const GENERAL_INTENT_ONLY_TOOLS = new Set([
   "self_update",
@@ -30,15 +30,15 @@ const GENERAL_INTENT_ONLY_TOOLS = new Set([
 const INTENT_TOOLS = {
   decisions:   new Set(["get_recent_decisions"]),
   deploy:      new Set(["deploy_position", "get_top_candidates", "get_active_bin", "get_pool_memory", "check_smart_wallets_on_pool", "get_token_holders", "get_token_narrative", "get_token_info", "search_pools", "get_wallet_balance", "get_my_positions", "add_pool_note"]),
-  close:       new Set(["close_position", "get_my_positions", "get_position_pnl", "get_wallet_balance", "swap_token", "sentinel_analyze", "sentinel_calculate_reward", "sentinel_evaluate_closed", "sentinel_get_status", "sentinel_set_weights", "sentinel_set_thresholds"]),
-  claim:       new Set(["claim_fees", "get_my_positions", "get_position_pnl", "get_wallet_balance", "sentinel_analyze", "sentinel_calculate_reward", "sentinel_get_status"]),
+  close:       new Set(["close_position", "get_my_positions", "get_position_pnl", "get_position_health", "get_wallet_balance", "swap_token", "sentinel_analyze", "sentinel_calculate_reward", "sentinel_evaluate_closed", "sentinel_get_status", "sentinel_set_weights", "sentinel_set_thresholds"]),
+  claim:       new Set(["claim_fees", "get_my_positions", "get_position_pnl", "get_position_health", "get_wallet_balance", "sentinel_analyze", "sentinel_calculate_reward", "sentinel_get_status"]),
   swap:        new Set(["swap_token", "get_wallet_balance"]),
-  sentinel:    new Set(["sentinel_analyze", "sentinel_calculate_reward", "sentinel_classify_regime", "sentinel_calculate_p_exit", "sentinel_calculate_il", "sentinel_get_status", "sentinel_set_weights", "sentinel_set_thresholds", "sentinel_evaluate_closed", "get_my_positions", "get_position_pnl"]),
+  sentinel:    new Set(["sentinel_analyze", "sentinel_calculate_reward", "sentinel_classify_regime", "sentinel_calculate_p_exit", "sentinel_calculate_il", "sentinel_get_status", "sentinel_set_weights", "sentinel_set_thresholds", "sentinel_evaluate_closed", "get_my_positions", "get_position_pnl", "get_position_health"]),
   config:      new Set(["update_config"]),
   blocklist:   new Set(["add_to_blacklist", "remove_from_blacklist", "list_blacklist", "block_deployer", "unblock_deployer", "list_blocked_deployers"]),
   selfupdate:  new Set(["self_update"]),
   balance:     new Set(["get_wallet_balance", "get_my_positions", "get_wallet_positions"]),
-  positions:   new Set(["get_my_positions", "get_position_pnl", "get_wallet_balance", "set_position_note", "get_wallet_positions"]),
+  positions:   new Set(["get_my_positions", "get_position_pnl", "get_position_health", "get_wallet_balance", "set_position_note", "get_wallet_positions"]),
   strategy:    new Set(["list_strategies", "get_strategy", "add_strategy", "update_strategy", "delete_strategy", "remove_strategy", "set_active_strategy"]),
   screen:      new Set(["get_top_candidates", "get_token_holders", "get_token_narrative", "get_token_info", "search_pools", "check_smart_wallets_on_pool", "get_pool_detail", "get_my_positions", "discover_pools"]),
   memory:      new Set(["recall_memory", "reflect_on_memory", "retain_memory", "get_pool_memory", "add_pool_note", "list_blacklist", "add_to_blacklist", "remove_from_blacklist"]),

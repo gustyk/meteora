@@ -1398,6 +1398,32 @@ Weights α,β,γ,λ default from config.sentinel.weights. β is typically the hi
       }
     }
   },
+
+  // ═══════════════════════════════════════════
+  //  POSITION HEALTH (MANAGEMENT PERFORMANCE LAYER)
+  // ═══════════════════════════════════════════
+  {
+    type: "function",
+    function: {
+      name: "get_position_health",
+      description: `Comprehensive one-call snapshot of a single open position. Aggregates:
+- Trajectory metrics (PnL velocity, fee velocity, drawdown from peak, time-in-range)
+- Lifecycle stage (early / mid / late by age)
+- Gas cost awareness (close cost as % of position value)
+- Sentinel evaluation (regime, P_exit, IL, recommended action)
+- Action hints (e.g. "drawdown approaching trail trigger", "yield collapsing")
+Use this INSTEAD of calling get_position_pnl + sentinel_analyze + get_active_bin separately.
+Saves 2-3 tool calls per position.`,
+      parameters: {
+        type: "object",
+        properties: {
+          position_address: { type: "string", description: "The position public key." },
+          pool_address:     { type: "string", description: "The pool address." }
+        },
+        required: ["position_address", "pool_address"]
+      }
+    }
+  },
 ];
 
 export const tools = toolDefinitions.map((tool) => ({

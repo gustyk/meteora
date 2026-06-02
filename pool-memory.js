@@ -333,6 +333,22 @@ export function recordPositionSnapshot(poolAddress, snapshot) {
 }
 
 /**
+ * Read recent position snapshots for a pool (optionally filtered by position address).
+ * Returns an array of snapshot records, oldest first, capped by `limit`.
+ * Each snapshot: { ts, position, pnl_pct, pnl_usd, in_range, unclaimed_fees_usd, minutes_out_of_range, age_minutes }
+ */
+export function getPoolSnapshots(poolAddress, { limit = 48, position = null } = {}) {
+  if (!poolAddress) return [];
+  const db = load();
+  const entry = db[poolAddress];
+  if (!entry?.snapshots) return [];
+  const filtered = position
+    ? entry.snapshots.filter((s) => s.position === position)
+    : entry.snapshots;
+  return filtered.slice(-Math.max(1, limit));
+}
+
+/**
  * Recall focused context for a specific pool — used before screening or management.
  * Returns a short formatted string ready for injection into the agent goal.
  */

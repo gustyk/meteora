@@ -41,6 +41,9 @@ import {
   calculateBinExitProbability,
   calculateIL,
 } from "./sentinel.js";
+import { computePositionMetrics } from "../position-metrics.js";
+import { getTrackedPosition } from "../state.js";
+import { getActiveBin as dlmmGetActiveBin } from "./dlmm.js";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -435,6 +438,94 @@ const toolMap = {
     });
     return { success: true, ...result };
   },
+
+  // ─── Position Health (Management Performance Layer) ─────────────
+  // 1-call snapshot: trajectory metrics + lifecycle + Sentinel eval + hints.
+  // Saves 2-3 tool calls per position in management cycles.
+  get_position_health: async ({ position_address, pool_address } = {}) => {
+    if (!position_address || !pool_address) {
+      return { error: "position_address and pool_address required" };
+    }
+    try {
+      const positions = await getMyPositions({ force: false }).catch(() => null);
+      const live = positions?.positions?.find((p) => p.position === position_address);
+      if (!live) return { error: `Position ${position_address} not found in wallet` };
+
+      const record = getTrackedPosition(position_address) || {};
+
+      // 1) Trajectory metrics
+      const metrics = computePositionMetrics({
+        pool_address,
+        position_address,
+        positionData: live,
+        positionRecord: record,
+        config,
+        estCloseCostSol: config.management?.estCloseCostSol ?? 0.005,
+      });
+
+      // 2) Sentinel evaluation (regime, P_exit, IL, recommendation)
+      let sentinel = null;
+      try {
+        sentinel = await runSentinelEvaluation({
+          position: {
+            position_address,
+            pool_address,
+            initial_price: record.initial_price || null,
+            lower_bin_id: live.lower_bin ?? record.bin_range?.lowerBinId ?? null,
+            upper_bin_id: live.upper_bin ?? record.bin_range?.upperBinId ?? null,
+            bin_step: live.bin_step ?? record.bin_step ?? null,
+            last_sentinel_eval: record.last_sentinel_eval,
+            strategy: record.strategy,
+          },
+          volatility: record.volatility ?? null,
+        });
+      } catch (e) {
+        log("sentinel_warn", `get_position_health: sentinel eval failed: ${e.message}`);
+      }
+
+      // 3) Action hint aggregator — merge trajectory + sentinel
+      const hints = [...(metrics.hints || [])];
+      if (sentinel?.recommendation?.action === "EMERGENCY_WITHDRAW") {
+        hints.push("SENTINEL: emergency |IL| — withdraw to stable");
+      } else if (sentinel?.recommendation?.action === "HEDGE_DELTA") {
+        hints.push("SENTINEL: hedge IL with perp short");
+      } else if (sentinel?.recommendation?.action === "REBALANCE_SHAPE") {
+        hints.push(`SENTINEL: rebalance to ${sentinel.recommendation.targetShape} (widen distribution)`);
+      } else if (sentinel?.recommendation?.action === "TIGHTEN_SHAPE") {
+        hints.push(`SENTINEL: tighten to ${sentinel.recommendation.targetShape} (concentrate)`);
+      } else if (sentinel?.recommendation?.action === "HOLD" && !sentinel.recommendation.cooldownOk) {
+        hints.push("SENTINEL: cooldown active — wait before rebalance");
+      }
+
+      return {
+        success: true,
+        position_address,
+        pool_address,
+        pair: live.pair,
+        pnl_pct: live.pnl_pct,
+        unclaimed_fees_usd: live.unclaimed_fees_usd,
+        total_value_usd: live.total_value_usd,
+        in_range: live.in_range,
+        minutes_out_of_range: live.minutes_out_of_range,
+        fee_per_tvl_24h: live.fee_per_tvl_24h,
+        // Trajectory
+        metrics,
+        // Sentinel
+        sentinel: sentinel ? {
+          regime: sentinel.regime,
+          p_exit: sentinel.pExit,
+          il_pct: sentinel.ilPct,
+          recommendation: sentinel.recommendation?.action,
+          target_shape: sentinel.recommendation?.targetShape,
+          reward: sentinel.reward?.reward,
+        } : null,
+        hints,
+      };
+    } catch (error) {
+      log("error", `get_position_health failed: ${error.message}`);
+      return { error: error.message };
+    }
+  },
   list_blacklist: listBlacklist,
   block_deployer: blockDev,
   unblock_deployer: unblockDev,
@@ -523,6 +614,13 @@ const toolMap = {
       gasReserve: ["management", "gasReserve"],
       positionSizePct: ["management", "positionSizePct"],
       minAgeBeforeYieldCheck: ["management", "minAgeBeforeYieldCheck"],
+      // Management Performance Layer (16-item overhaul)
+      estCloseCostSol: ["management", "estCloseCostSol"],
+      minCloseWorthinessSol: ["management", "minCloseWorthinessSol"],
+      drawdownGuardPct: ["management", "drawdownGuardPct"],
+      autoSentinelEnabled: ["management", "autoSentinelEnabled"],
+      comparableAltEnabled: ["management", "comparableAltEnabled"],
+      drawdownGuardForceExit: ["management", "drawdownGuardForceExit"],
       // risk
       maxPositions: ["risk", "maxPositions"],
       maxDeployAmount: ["risk", "maxDeployAmount"],
