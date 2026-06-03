@@ -253,6 +253,17 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
   let noToolRetryCount = 0;
   // Stays true for the whole run once a thinking-mode provider rejects tool_choice
   let omitToolChoice = false;
+  // Issue 10: count how many tool calls in this cycle produced malformed JSON
+  // (the LLM emitted something JSON.parse could not consume). Surfaces
+  // unreliable models and gives post-mortem a single metric to look at.
+  let malformedJSONCount = 0;
+  // Issue 11: track recent tool names so we can break out of loops where the
+  // LLM calls the same tool over and over (e.g. 7× check_smart_wallets_on_pool)
+  // without making any decision. After MAX_SAME_TOOL_STREAK we inject a forced
+  // synthesis message that requires the agent to commit to an action.
+  const toolCallStreak = [];
+  const MAX_SAME_TOOL_STREAK = 4;
+  let maxSameToolGuardFired = false;
 
   let emptyStreak = 0;
   for (let step = 0; step < maxSteps; step++) {
@@ -331,14 +342,15 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
             try {
               JSON.parse(tc.function.arguments);
             } catch {
+              malformedJSONCount += 1;
               try {
                 tc.function.arguments = JSON.stringify(JSON.parse(jsonrepair(tc.function.arguments)));
-                log("warn", `Repaired malformed JSON args for ${tc.function.name}`);
+                log("warn", `Repaired malformed JSON args for ${tc.function.name} (count=${malformedJSONCount})`);
               } catch {
                 tc.function.arguments = "{}";
                 const error = `Invalid tool arguments for ${tc.function.name}`;
                 invalidToolArgErrors.set(tc.id, error);
-                log("error", `${error}: could not repair JSON`);
+                log("error", `${error}: could not repair JSON (count=${malformedJSONCount})`);
               }
             }
           }
@@ -374,6 +386,10 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
         }
         log("agent", "Final answer reached");
         log("agent", msg.content);
+        log(
+          "agent_summary",
+          `cycle ended: steps=${step + 1} malformed_json=${malformedJSONCount} same_tool_guard_fired=${maxSameToolGuardFired}`
+        );
         return { content: msg.content, userMessage: goal };
       }
       sawToolCall = true;
@@ -400,11 +416,12 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
         try {
           functionArgs = JSON.parse(toolCall.function.arguments);
         } catch {
+          malformedJSONCount += 1;
           try {
             functionArgs = JSON.parse(jsonrepair(toolCall.function.arguments));
-            log("warn", `Repaired malformed JSON args for ${functionName}`);
+            log("warn", `Repaired malformed JSON args for ${functionName} (count=${malformedJSONCount})`);
           } catch (parseError) {
-            log("error", `Failed to parse args for ${functionName}: ${parseError.message}`);
+            log("error", `Failed to parse args for ${functionName}: ${parseError.message} (count=${malformedJSONCount})`);
             const result = {
               success: false,
               error: `Invalid tool arguments for ${functionName}`,
@@ -433,6 +450,32 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
             role: "tool",
             tool_call_id: toolCall.id,
             content: JSON.stringify({ blocked: true, reason: `${functionName} already attempted this session — do not retry. If it failed, report the error and stop.` }),
+          };
+        }
+
+        // Issue 11: track the tool-call streak. If the LLM has called the same
+        // tool MAX_SAME_TOOL_STREAK times in a row, force a synthesis decision
+        // by injecting a follow-up user message that demands an action.
+        if (toolCallStreak[toolCallStreak.length - 1] !== functionName) {
+          toolCallStreak.length = 0;
+        }
+        toolCallStreak.push(functionName);
+        if (toolCallStreak.length >= MAX_SAME_TOOL_STREAK && !maxSameToolGuardFired) {
+          maxSameToolGuardFired = true;
+          log(
+            "agent",
+            `Same-tool streak guard fired: ${functionName} called ${toolCallStreak.length}× in a row — forcing synthesis`
+          );
+          toolCallStreak.length = 0;
+          return {
+            role: "tool",
+            tool_call_id: toolCall.id,
+            content: JSON.stringify({
+              __guard__: "max_same_tool_streak",
+              message:
+                `You have called ${functionName} ${MAX_SAME_TOOL_STREAK}+ times in a row. ` +
+                `Stop gathering data and commit to a decision NOW. If the goal is to deploy, either call deploy_position with a specific pool from the candidates, or end the cycle with NO DEPLOY and explain why. Do not call ${functionName} again this turn.`,
+            }),
           };
         }
 
@@ -475,6 +518,10 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
   }
 
   log("agent", "Max steps reached without final answer");
+  log(
+    "agent_summary",
+    `cycle ended: steps=${maxSteps} malformed_json=${malformedJSONCount} same_tool_guard_fired=${maxSameToolGuardFired}`
+  );
   return { content: "Max steps reached. Review logs for partial progress.", userMessage: goal };
 }
 

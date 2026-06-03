@@ -15,6 +15,8 @@ const STATE_FILE = "./state.json";
 
 const MAX_RECENT_EVENTS = 20;
 const MAX_INSTRUCTION_LENGTH = 280;
+const MAX_RECENT_DEPLOYS = 50;
+const DEFAULT_RECENT_DEPLOY_COOLDOWN_HOURS = 6;
 
 function sanitizeStoredText(text, maxLen = MAX_INSTRUCTION_LENGTH) {
   if (text == null) return null;
@@ -29,13 +31,15 @@ function sanitizeStoredText(text, maxLen = MAX_INSTRUCTION_LENGTH) {
 
 function load() {
   if (!fs.existsSync(STATE_FILE)) {
-    return { positions: {}, recentEvents: [], lastUpdated: null };
+    return { positions: {}, recentEvents: [], recent_deploys: [], lastUpdated: null };
   }
   try {
-    return JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+    const parsed = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+    if (!Array.isArray(parsed.recent_deploys)) parsed.recent_deploys = [];
+    return parsed;
   } catch (err) {
     log("state_error", `Failed to read state.json: ${err.message}`);
-    return { positions: {}, lastUpdated: null };
+    return { positions: {}, recent_deploys: [], lastUpdated: null };
   }
 }
 
@@ -106,6 +110,7 @@ export function trackPosition({
     trailing_active: false,
   };
   pushEvent(state, { action: "deploy", position, pool_name: pool_name || pool });
+  pushRecentDeploy(state, { pool, pool_name: pool_name || pool, position });
   save(state);
   log("state", `Tracked new position: ${position} in pool ${pool}`);
 }
@@ -172,6 +177,58 @@ function pushEvent(state, event) {
   if (state.recentEvents.length > MAX_RECENT_EVENTS) {
     state.recentEvents = state.recentEvents.slice(-MAX_RECENT_EVENTS);
   }
+}
+
+/**
+ * Append a record to the recent-deployed list (used to prevent the screener
+ * from re-picking the same pool cycle after cycle when the top-5 candidates
+ * are stable). Older entries are trimmed to MAX_RECENT_DEPLOYS.
+ */
+function pushRecentDeploy(state, { pool, pool_name, position }) {
+  if (!state.recent_deploys) state.recent_deploys = [];
+  state.recent_deploys.push({
+    pool,
+    pool_name: pool_name || null,
+    position: position || null,
+    deployed_at: new Date().toISOString(),
+  });
+  if (state.recent_deploys.length > MAX_RECENT_DEPLOYS) {
+    state.recent_deploys = state.recent_deploys.slice(-MAX_RECENT_DEPLOYS);
+  }
+}
+
+/**
+ * Was this pool deployed within the last `cooldownHours`? Used by
+ * getTopCandidates to break out of the "stuck on RKC-SOL" pattern where the
+ * screener sees the same top-5 candidates and re-picks the same pool every
+ * cycle. Returns `{ recent: true, lastDeployedAt, hoursAgo }` or `null`.
+ */
+export function isRecentlyDeployed(pool, cooldownHours = DEFAULT_RECENT_DEPLOY_COOLDOWN_HOURS) {
+  if (!pool) return null;
+  const state = load();
+  if (!Array.isArray(state.recent_deploys) || state.recent_deploys.length === 0) return null;
+  const now = Date.now();
+  const cooldownMs = Math.max(0, Number(cooldownHours) || 0) * 3600_000;
+  for (let i = state.recent_deploys.length - 1; i >= 0; i--) {
+    const rec = state.recent_deploys[i];
+    if (!rec || rec.pool !== pool) continue;
+    if (!rec.deployed_at) continue;
+    const ageMs = now - new Date(rec.deployed_at).getTime();
+    if (Number.isFinite(ageMs) && ageMs >= 0 && ageMs <= cooldownMs) {
+      return { recent: true, lastDeployedAt: rec.deployed_at, hoursAgo: ageMs / 3600_000 };
+    }
+    return null;
+  }
+  return null;
+}
+
+/**
+ * Snapshot of the most recent N deploys (for diagnostic / display).
+ */
+export function getRecentDeploys(limit = 10) {
+  const state = load();
+  if (!Array.isArray(state.recent_deploys)) return [];
+  return state.recent_deploys.slice(-Math.max(1, limit)).reverse();
 }
 
 /**

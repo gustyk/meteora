@@ -105,14 +105,47 @@ async function fetchFreshPoolDetail(poolAddress, timeframe = config.screening.ti
 }
 
 async function validateDeployPoolThresholds(args) {
+  // ─── Pre-flight: validate the pool_address is a plausible Solana pubkey ──
+  // Catches the LLM-emitted truncated addresses like
+  // "Bmovbz2FMD3qgTYfKE7wJHJbm8MJDv" (33 chars) before we burn a 1-2s API
+  // call and a safety_block round-trip.
+  const poolAddress = args.pool_address;
+  if (typeof poolAddress !== "string" || poolAddress.length < 32 || poolAddress.length > 44) {
+    return {
+      pass: false,
+      reason:
+        `Invalid pool_address length (${poolAddress?.length ?? 0} chars). ` +
+        `A Solana public key must be 32-44 characters of base58. ` +
+        `STOP. Do NOT retry deploy_position with this address — re-pick a different pool from the candidates list and copy the full pool address from get_top_candidates output.`,
+    };
+  }
+  if (!/^[1-9A-HJ-NP-Za-km-z]+$/.test(poolAddress)) {
+    return {
+      pass: false,
+      reason:
+        `pool_address contains non-base58 characters. ` +
+        `STOP. Do NOT retry deploy_position with this address — re-pick a different pool.`,
+    };
+  }
+
   let detail;
   try {
-    detail = await fetchFreshPoolDetail(args.pool_address);
-    if (!detail) throw new Error(`Pool ${args.pool_address} not found`);
+    detail = await fetchFreshPoolDetail(poolAddress);
+    if (!detail) {
+      return {
+        pass: false,
+        reason:
+          `Pool ${poolAddress} not found in Meteora pool discovery. ` +
+          `STOP. Do NOT retry deploy_position on this address. The address may be truncated, the pool may be delisted, or the API may be rate-limited. ` +
+          `Re-pick a different pool from get_top_candidates output.`,
+      };
+    }
   } catch (error) {
     return {
       pass: false,
-      reason: `Could not verify pool screening thresholds before deploy: ${error.message}`,
+      reason:
+        `Could not verify pool screening thresholds before deploy: ${error.message}. ` +
+        `STOP. Do NOT retry deploy_position this cycle — wait for the next cycle or pick a different pool.`,
     };
   }
 

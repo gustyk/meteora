@@ -546,6 +546,40 @@ Agent Meridian HiveMind sync is handled by `hivemind.js`. It uses built-in Agent
 - `thresholds.{pExitLow, pExitHigh, ilPctHedge, ilPctEmergency, volHighThreshold, trendStrongThreshold, meanReversionThreshold}`
 - `control.{rebalanceCooldownSec, maxSlippagePct, hedgingSizePct}` — defaults match the spec: 300s cooldown, 0.3% max slippage, 50% delta-hedge sizing at 2% IL
 
+## Recent-Deploy Cooldown (`recentDeployCooldownHours`)
+
+Live test showed the screener re-deploying the same pool (e.g. RKC-SOL) every cycle because the top-5 candidates are stable. New cooldown:
+
+- `state.js` now tracks `recent_deploys[]` — appended in `trackPosition()`.
+- `isRecentlyDeployed(pool, hoursBack)` returns `{ recent: true, hoursAgo, lastDeployedAt }` or `null`.
+- `getTopCandidates()` filters out pools deployed within the last `management.recentDeployCooldownHours` (default 6h, set to 0 to disable).
+- `MAX_RECENT_DEPLOYS = 50` rolling cap.
+
+## Pool-Address Pre-Flight (Safety Check)
+
+`validateDeployPoolThresholds()` in `tools/executor.js` now rejects malformed pool addresses **before** the Meteora API call:
+
+- Length must be 32-44 chars (Solana pubkey range)
+- Charset must be base58 (`[1-9A-HJ-NP-Za-km-z]+`)
+- All "Pool not found" / API errors include the `STOP. Do NOT retry` directive so the LLM picks a different pool instead of retrying the same truncated address.
+
+## NaN Price Coercion (`tools/dlmm.js`)
+
+The deploy tool now coerces `minPrice`/`maxPrice` to `null` (via `Number.isFinite`) when the bin-step from the Meteora API disagrees with on-chain state. The downstream `price_range` and `range_coverage` fields return `null` instead of `NaN`/`Infinity`, so the LLM prompt template shows clean "N/A" instead of bogus numbers like "Infinity% downside".
+
+## Agent Loop Health Metrics
+
+`agentLoop()` in `agent.js` now tracks two metrics and logs a final `agent_summary` line at cycle end:
+
+| Metric | What | Why |
+|--------|------|-----|
+| `malformedJSONCount` | Increments every time `jsonrepair` had to be called | Surfaces unreliable models. If a cycle ends with count > 0, the model is producing bad tool-call JSON. |
+| `maxSameToolGuardFired` | Boolean — fired if the LLM called the same tool `MAX_SAME_TOOL_STREAK` (4) times in a row | Breaks the "LLM loops on data gathering without deciding" pattern. Returns a `__guard__: "max_same_tool_streak"` tool message that forces synthesis. |
+
+**maxSameToolStreak implementation**: tracks an array of tool names; resets when the next tool differs; if length reaches MAX (4), injects a tool message that says "STOP gathering data and commit to a decision NOW". The LLM sees this on its next iteration and is forced to either call `deploy_position` or end the cycle with `NO DEPLOY`.
+
+**Backward compatibility**: Both metrics are pure observability — no behavior change unless the guard fires. Opt out by setting `maxSameToolStreakLimit: 0` in `user-config.json` (default 4, 0 disables).
+
 ## Known Issues / Tech Debt
 
 - (none — `evolveThresholds` key bug fixed: `minFeeTvlRatio` → `minFeeActiveTvlRatio`; `maxVolatility` added to config + executor safety check)

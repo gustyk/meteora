@@ -605,9 +605,15 @@ export async function deployPosition({
 
   const minPrice = Number(getPriceOfBinByBinId(minBinId, actualBinStep).toString());
   const maxPrice = Number(getPriceOfBinByBinId(maxBinId, actualBinStep).toString());
-  const downsideCoveragePct = activePrice > 0 ? ((activePrice - minPrice) / activePrice) * 100 : null;
-  const upsideCoveragePct = activePrice > 0 ? ((maxPrice - activePrice) / activePrice) * 100 : null;
-  const totalWidthPct = minPrice > 0 ? ((maxPrice - minPrice) / minPrice) * 100 : null;
+  // If the price resolution returns a non-finite value (NaN / Infinity —
+  // usually a sign the bin_step from the discovery API disagrees with the
+  // on-chain state), coerce to null so downstream code and the LLM prompt
+  // show "N/A" instead of bogus numbers like "Infinity%".
+  const safeMinPrice = Number.isFinite(minPrice) ? minPrice : null;
+  const safeMaxPrice = Number.isFinite(maxPrice) ? maxPrice : null;
+  const downsideCoveragePct = activePrice > 0 && safeMinPrice != null ? ((activePrice - safeMinPrice) / activePrice) * 100 : null;
+  const upsideCoveragePct = activePrice > 0 && safeMaxPrice != null ? ((safeMaxPrice - activePrice) / activePrice) * 100 : null;
+  const totalWidthPct = safeMinPrice != null && safeMinPrice > 0 && safeMaxPrice != null ? ((safeMaxPrice - safeMinPrice) / safeMinPrice) * 100 : null;
 
   // Read base fee directly from pool — baseFactor * binStep / 10^6 gives fee in %
   const baseFactor = pool.lbPair.parameters?.baseFactor ?? 0;
@@ -736,7 +742,7 @@ export async function deployPosition({
         pool: pool_address,
         pool_name,
         bin_range: { min: minBinId, max: maxBinId, active: activeBin.binId },
-        price_range: { min: minPrice, max: maxPrice },
+        price_range: { min: safeMinPrice, max: safeMaxPrice },
         range_coverage: {
           downside_pct: downsideCoveragePct,
           upside_pct: upsideCoveragePct,
@@ -871,7 +877,7 @@ export async function deployPosition({
       pool: pool_address,
       pool_name,
       bin_range: { min: minBinId, max: maxBinId, active: activeBin.binId },
-      price_range: { min: minPrice, max: maxPrice },
+      price_range: { min: safeMinPrice, max: safeMaxPrice },
       range_coverage: {
         downside_pct: downsideCoveragePct,
         upside_pct: upsideCoveragePct,
@@ -2054,3 +2060,4 @@ async function lookupPoolForPosition(position_address, walletAddress) {
 
   throw new Error(`Position ${position_address} not found in open positions`);
 }
+

@@ -615,6 +615,21 @@ export async function getTopCandidates({ limit = 10 } = {}) {
   const maxTvl = config.screening.maxTvl == null ? null : Number(config.screening.maxTvl);
   const minFeeActiveTvlRatio = Number(config.screening.minFeeActiveTvlRatio ?? 0);
 
+  // Exclude pools we just deployed into within the recentDeployCooldownHours
+  // window — prevents the "stuck on RKC-SOL" pattern where top-5 candidates are
+  // stable and the LLM keeps re-picking the same pool cycle after cycle.
+  // Set recentDeployCooldownHours to 0 in user-config.json to disable.
+  const recentCooldownHours = Number(config.management?.recentDeployCooldownHours ?? 6);
+  let recentDeployLookup = null;
+  if (Number.isFinite(recentCooldownHours) && recentCooldownHours > 0) {
+    try {
+      const { isRecentlyDeployed } = await import("../state.js");
+      recentDeployLookup = isRecentlyDeployed;
+    } catch {
+      recentDeployLookup = null;
+    }
+  }
+
   const eligible = pools
     .filter((p) => {
       const tvl = Number(p.tvl ?? p.active_tvl ?? 0);
@@ -666,6 +681,17 @@ export async function getTopCandidates({ limit = 10 } = {}) {
         log("screening", `Filtered cooldown token ${p.base?.symbol} (${p.base?.mint?.slice(0, 8)})`);
         pushFilteredReason(filteredOut, p, "token cooldown active");
         return false;
+      }
+      if (recentDeployLookup && recentCooldownHours > 0) {
+        const recent = recentDeployLookup(p.pool, recentCooldownHours);
+        if (recent?.recent) {
+          pushFilteredReason(
+            filteredOut,
+            p,
+            `recently deployed ${recent.hoursAgo.toFixed(1)}h ago (cooldown ${recentCooldownHours}h)`
+          );
+          return false;
+        }
       }
       return true;
     });
