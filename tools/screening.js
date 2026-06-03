@@ -804,7 +804,7 @@ export async function getTopCandidates({ limit = 10 } = {}) {
       }
       // Mark pools where OKX risk+adv data is completely unavailable
       // so compositeScore can apply an uncertainty penalty.
-      if (adv.status !== "fulfilled" && risk.status !== "fulfilled") {
+      if (!adv && !risk) {
         eligible[i]._okxUnavailable = true;
       }
     }
