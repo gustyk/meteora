@@ -26,6 +26,19 @@ const GENERAL_INTENT_ONLY_TOOLS = new Set([
   "set_active_strategy",
 ]);
 
+// Tools the LLM is allowed to call after the max-same-tool-streak guard fires.
+// Research/data-gathering tools are stripped — only deploy/action tools remain
+// so the LLM is forced to commit to a decision instead of iterating.
+const ACTION_TOOLS_BY_ROLE = {
+  SCREENER: new Set(["deploy_position"]),
+  MANAGER:  new Set(["close_position", "claim_fees", "swap_token", "get_position_pnl", "get_position_health", "get_wallet_balance", "get_my_positions"]),
+};
+function filterActionTools(fullList, agentType) {
+  const allowed = ACTION_TOOLS_BY_ROLE[agentType];
+  if (!allowed) return fullList;
+  return fullList.filter(t => allowed.has(t.function.name));
+}
+
 // Intent → tool subsets for GENERAL role
 const INTENT_TOOLS = {
   decisions:   new Set(["get_recent_decisions"]),
@@ -264,6 +277,12 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
   const toolCallStreak = [];
   const MAX_SAME_TOOL_STREAK = 4;
   let maxSameToolGuardFired = false;
+  // Issue 12: once the guard fires, strip research tools and only offer
+  // deploy/action tools for the remaining steps. Prevents the common pattern
+  // where the LLM switches from check_smart_wallets to get_token_info after
+  // the guard message, burning another 10 steps on the same "data gathering
+  // without deciding" loop.
+  let actionToolsOnly = false;
 
   let emptyStreak = 0;
   for (let step = 0; step < maxSteps; step++) {
@@ -285,7 +304,9 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
           const reqParams = {
             model: usedModel,
             messages,
-            tools: getToolsForRole(agentType, goal),
+            tools: actionToolsOnly
+              ? filterActionTools(getToolsForRole(agentType, goal), agentType)
+              : getToolsForRole(agentType, goal),
             ...getDecodingParams(agentType),
             max_tokens: maxOutputTokens ?? config.llm.maxTokens,
           };
@@ -438,18 +459,22 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
 
         // Block once-per-session tools from firing a second time
         if (ONCE_PER_SESSION.has(functionName) && firedOnce.has(functionName)) {
+          const isDeploy = functionName === "deploy_position";
+          const blockedReason = isDeploy
+            ? `deploy_position was already executed this session — whether it succeeded, was blocked by safety checks, or was a dry-run simulation, you MUST NOT retry it. Treat the result you received as final. Report the outcome and end the cycle.`
+            : `${functionName} already attempted this session — do not retry. If it failed, report the error and stop.`;
           log("agent", `Blocked duplicate ${functionName} call — already executed this session`);
           await onToolFinish?.({
             name: functionName,
             args: functionArgs,
-            result: { blocked: true, reason: `${functionName} already attempted this session — do not retry. If it failed, report the error and stop.` },
+            result: { blocked: true, reason: blockedReason },
             success: false,
             step,
           });
           return {
             role: "tool",
             tool_call_id: toolCall.id,
-            content: JSON.stringify({ blocked: true, reason: `${functionName} already attempted this session — do not retry. If it failed, report the error and stop.` }),
+            content: JSON.stringify({ blocked: true, reason: blockedReason }),
           };
         }
 
@@ -462,9 +487,10 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
         toolCallStreak.push(functionName);
         if (toolCallStreak.length >= MAX_SAME_TOOL_STREAK && !maxSameToolGuardFired) {
           maxSameToolGuardFired = true;
+          actionToolsOnly = true;
           log(
             "agent",
-            `Same-tool streak guard fired: ${functionName} called ${toolCallStreak.length}× in a row — forcing synthesis`
+            `Same-tool streak guard fired: ${functionName} called ${toolCallStreak.length}× in a row — action-only mode`
           );
           toolCallStreak.length = 0;
           return {
@@ -474,7 +500,10 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
               __guard__: "max_same_tool_streak",
               message:
                 `You have called ${functionName} ${MAX_SAME_TOOL_STREAK}+ times in a row. ` +
-                `Stop gathering data and commit to a decision NOW. If the goal is to deploy, either call deploy_position with a specific pool from the candidates, or end the cycle with NO DEPLOY and explain why. Do not call ${functionName} again this turn.`,
+                `All research/data-gathering tools have been REMOVED. You now have access to only action tools ` +
+                `(e.g. deploy_position, close_position, swap_token). ` +
+                `Commit to a decision NOW. If the goal is to deploy, call deploy_position with a specific pool ` +
+                `from the candidates you already have data on. Otherwise, end the cycle with NO DEPLOY.`,
             }),
           };
         }

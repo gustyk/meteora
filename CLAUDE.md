@@ -578,7 +578,21 @@ The deploy tool now coerces `minPrice`/`maxPrice` to `null` (via `Number.isFinit
 
 **maxSameToolStreak implementation**: tracks an array of tool names; resets when the next tool differs; if length reaches MAX (4), injects a tool message that says "STOP gathering data and commit to a decision NOW". The LLM sees this on its next iteration and is forced to either call `deploy_position` or end the cycle with `NO DEPLOY`.
 
+**After the guard fires**, all research/data-gathering tools are REMOVED from the LLM's tool list (`actionToolsOnly = true`). Only action tools remain:
+- SCREENER: `deploy_position` only
+- MANAGER: `close_position`, `claim_fees`, `swap_token`, `get_position_pnl`, `get_position_health`, `get_wallet_balance`, `get_my_positions`
+
+This prevents the common post-guard pattern where the LLM switches from `check_smart_wallets_on_pool` to `get_token_info` and burns another 10 steps on "data gathering without deciding".
+
 **Backward compatibility**: Both metrics are pure observability — no behavior change unless the guard fires. Opt out by setting `maxSameToolStreakLimit: 0` in `user-config.json` (default 4, 0 disables).
+
+## Deploy Retry Prevention
+
+Two mechanisms prevent the LLM from calling `deploy_position` multiple times in one cycle:
+
+1. **`NO_RETRY_TOOLS`** (agent.js) — `deploy_position` is locked after the FIRST attempt regardless of outcome. Even if the deploy failed (safety_block) or was a dry-run simulation, the LLM may NOT retry it. The locked response message explicitly says: "whether it succeeded, was blocked by safety checks, or was a dry-run simulation, you MUST NOT retry it. Treat the result you received as final."
+
+2. **DRY_RUN note** (executor.js) — when `DRY_RUN=true` and `deploy_position` succeeds, the result includes `dry_run_note`: "DRY RUN: This was a simulated deployment. The on-chain wallet balance is NOT affected. Trust this result as final — do NOT retry deploy_position." This prevents the common confusion where the LLM calls `get_wallet_balance` after a DRY_RUN deploy, sees the balance unchanged, and assumes the deploy failed.
 
 ## Known Issues / Tech Debt
 
