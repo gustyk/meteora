@@ -572,9 +572,6 @@ export async function deployPosition({
   }
 
   if (process.env.DRY_RUN === "true") {
-    // Track the simulated deploy in recent_deploys so cooldown prevents
-    // the screener from re-picking the same pool in the next cycle.
-    trackDryRunDeploy({ pool: pool_address, pool_name });
     return {
       dry_run: true,
       would_deploy: {

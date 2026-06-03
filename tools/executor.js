@@ -881,6 +881,18 @@ export async function executeTool(name, args) {
     return { error };
   }
 
+  // ─── Track DRY_RUN deploy attempts BEFORE safety checks ──
+  // Even if safety check blocks the deploy, record the pool in recent_deploys
+  // so the screener doesn't re-pick it next cycle.
+  if (name === "deploy_position" && process.env.DRY_RUN === "true" && args?.pool_address) {
+    try {
+      const { trackDryRunDeploy } = await import("../state.js");
+      trackDryRunDeploy({ pool: args.pool_address, pool_name: args.pool_name || null });
+    } catch (e) {
+      log("warn", `Failed to track DRY_RUN deploy attempt: ${e.message}`);
+    }
+  }
+
   // ─── Pre-execution safety checks ──────────
   if (PROTECTED_TOOLS.has(name)) {
     const safetyCheck = await runSafetyChecks(name, args);

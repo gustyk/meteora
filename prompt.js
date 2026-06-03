@@ -220,6 +220,7 @@ PARALLEL FETCH RULE: If you need to call get_token_info, get_token_holders, get_
 DEPLOY RULES:
 - COMPOUNDING: Use the deploy amount from the goal EXACTLY. Do NOT default to a smaller number.
 - bins_below = round(config.strategy.minBinsBelow + (candidate volatility/5)*(config.strategy.maxBinsBelow-config.strategy.minBinsBelow)) clamped to [minBinsBelow,maxBinsBelow]. Volatility must be a positive number; 0/unknown means skip.
+- ⚠️ bins_below MUST be >= ${config.strategy.minBinsBelow} (${config.strategy.minBinsBelow}). Any value below this will be BLOCKED by safety check. Example: vol=3.5 → round(${config.strategy.minBinsBelow} + (3.5/5)*(${config.strategy.maxBinsBelow - config.strategy.minBinsBelow})) = ${Math.round(config.strategy.minBinsBelow + (3.5/5)*(config.strategy.maxBinsBelow - config.strategy.minBinsBelow))}.
 - Use amount_y only, keep amount_x=0 and bins_above=0.
 - Pick ONE pool only when conviction is real. If only one weak candidate survives with score < ${convictionThreshold}, skip and explain why none qualify.
 
