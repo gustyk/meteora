@@ -198,6 +198,18 @@ function pushRecentDeploy(state, { pool, pool_name, position }) {
 }
 
 /**
+ * Record a DRY_RUN deploy in recent_deploys so the cooldown filter
+ * prevents the screener from re-picking the same pool in the next cycle.
+ * Does NOT create a full position record (no on-chain position exists).
+ */
+export function trackDryRunDeploy({ pool, pool_name }) {
+  const state = load();
+  pushEvent(state, { action: "deploy_dry_run", pool_name: pool_name || pool, pool });
+  pushRecentDeploy(state, { pool, pool_name: pool_name || pool, position: null });
+  save(state);
+}
+
+/**
  * Was this pool deployed within the last `cooldownHours`? Used by
  * getTopCandidates to break out of the "stuck on RKC-SOL" pattern where the
  * screener sees the same top-5 candidates and re-picks the same pool every

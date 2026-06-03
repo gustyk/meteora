@@ -15,6 +15,7 @@ import { config, computeDeployAmount, MIN_SAFE_BINS_BELOW } from "../config.js";
 import { log } from "../logger.js";
 import {
   trackPosition,
+  trackDryRunDeploy,
   markOutOfRange,
   markInRange,
   recordClaim,
@@ -571,6 +572,9 @@ export async function deployPosition({
   }
 
   if (process.env.DRY_RUN === "true") {
+    // Track the simulated deploy in recent_deploys so cooldown prevents
+    // the screener from re-picking the same pool in the next cycle.
+    trackDryRunDeploy({ pool: pool_address, pool_name });
     return {
       dry_run: true,
       would_deploy: {
@@ -584,7 +588,7 @@ export async function deployPosition({
         amount_y: finalAmountY,
         wide_range: totalBins > 69,
       },
-      message: "DRY RUN — no transaction sent",
+      message: "DRY RUN — no transaction sent. Pool recorded in cooldown to prevent redeploy.",
     };
   }
 
