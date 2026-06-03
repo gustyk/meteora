@@ -1145,7 +1145,7 @@ Summarize the current portfolio health, total fees earned, and performance of al
             }
             continue;
           }
-          const cooldownMs = config.schedule.managementIntervalMin * 60 * 1000;
+          const cooldownMs = (config.management.pollerTriggerCooldownSec ?? 120) * 1000;
           const sinceLastTrigger = Date.now() - _pollTriggeredAt;
           if (sinceLastTrigger >= cooldownMs) {
             _pollTriggeredAt = Date.now();
@@ -1158,7 +1158,7 @@ Summarize the current portfolio health, total fees earned, and performance of al
         }
         const closeRule = getDeterministicCloseRule(p, config.management);
         if (closeRule) {
-          const cooldownMs = config.schedule.managementIntervalMin * 60 * 1000;
+          const cooldownMs = (config.management.pollerTriggerCooldownSec ?? 120) * 1000;
           const sinceLastTrigger = Date.now() - _pollTriggeredAt;
           if (sinceLastTrigger >= cooldownMs) {
             _pollTriggeredAt = Date.now();
@@ -1285,7 +1285,7 @@ function getDeterministicCloseRule(position, managementConfig) {
   if (
     position.fee_per_tvl_24h != null &&
     position.fee_per_tvl_24h < managementConfig.minFeePerTvl24h &&
-    (position.age_minutes ?? 0) >= 60
+    (position.age_minutes ?? 0) >= (managementConfig.minAgeBeforeYieldCheck ?? 120)
   ) {
     return { action: "CLOSE", rule: 5, reason: "low yield" };
   }

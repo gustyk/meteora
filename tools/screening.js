@@ -50,6 +50,9 @@ function scoreCandidate(pool) {
  *     - holders:              5%
  *     - mcap sweet-spot:      +5% if 200k..2M
  *     - volatility sweet:     +5% if 1..4
+ *     - smart_money_buy:      +10 (OKX signal)
+ *     - kol_in_clusters:      +8  (OKX signal)
+ *     - dev_sold_all:         +5  (OKX signal)
  *
  *   risk penalties (subtract from total):
  *     - top10 > 60%          -10
@@ -60,6 +63,7 @@ function scoreCandidate(pool) {
  *     - dex_boost / paid     -5
  *     - pool_memory hasLoss  -20
  *     - pool_memory avgPnl<0 -10
+ *     - OKX unavailable      -10 (data missing ≠ clean)
  */
 export function compositeScore(pool, { smartWalletCount = 0, poolMemorySignals = null } = {}) {
   const feeTvl = Number(pool.fee_active_tvl_ratio || 0);
@@ -83,6 +87,11 @@ export function compositeScore(pool, { smartWalletCount = 0, poolMemorySignals =
   if (vol >= 1 && vol <= 4) score += 5;
   if (vol > 4) score -= Math.min(15, (vol - 4) * 5); // vol 5 → -5, vol 7 → -15, etc.
 
+  // OKX enrichment signals — boost from data already fetched
+  if (pool.smart_money_buy) score += 10;
+  if (pool.kol_in_clusters) score += 8;
+  if (pool.dev_sold_all) score += 5;
+
   // Risk penalties
   if (top10 > 60) score -= 10;
   if (bundle > 30) score -= 10;
@@ -93,6 +102,9 @@ export function compositeScore(pool, { smartWalletCount = 0, poolMemorySignals =
   if (poolMemorySignals?.hasLoss) score -= 20;
   if (poolMemorySignals?.avgPnl != null && poolMemorySignals.avgPnl < 0) score -= 10;
   if (poolMemorySignals?.cooldownActive) score -= 30;
+
+  // OKX data unavailable — uncertainty penalty (data missing ≠ clean)
+  if (pool._okxUnavailable) score -= 10;
 
   return Math.max(0, Math.round(score));
 }
@@ -704,8 +716,11 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     .slice(0, 15);
   for (const p of preTop) {
     p._poolMemorySignals = getPoolMemorySignals(p.pool) || { exists: false, hasLoss: false, cooldownActive: false };
+    // Estimate smart wallet presence from OKX signals (actual smart wallet data
+    // is not available at this stage — enriched later in index.js).
+    const estimatedSw = (p.smart_money_buy ? 1 : 0) + (p.kol_in_clusters ? 1 : 0);
     p._compositeScore = compositeScore(p, {
-      smartWalletCount: 0, // not yet known at this stage — enriched later
+      smartWalletCount: estimatedSw,
       poolMemorySignals: p._poolMemorySignals,
     });
   }
@@ -787,7 +802,22 @@ export async function getTopCandidates({ limit = 10 } = {}) {
         eligible[i].top_cluster_trend    = clusters[0]?.trend ?? null;      // buy|sell|neutral
         eligible[i].top_cluster_hold_pct = clusters[0]?.holding_pct ?? null;
       }
+      // Mark pools where OKX risk+adv data is completely unavailable
+      // so compositeScore can apply an uncertainty penalty.
+      if (adv.status !== "fulfilled" && risk.status !== "fulfilled") {
+        eligible[i]._okxUnavailable = true;
+      }
     }
+    // Bundle holding hard filter — bundler dumps cause direct IL, consistent with bot_holders hard filter
+    const maxBundlePct = Number(config.screening.maxBundlePct ?? 30);
+    eligible.splice(0, eligible.length, ...eligible.filter((p) => {
+      if (p.bundle_pct != null && maxBundlePct > 0 && p.bundle_pct > maxBundlePct) {
+        log("screening", `Bundle filter: dropped ${p.name} — bundle ${p.bundle_pct}% > ${maxBundlePct}%`);
+        pushFilteredReason(filteredOut, p, `bundle ${p.bundle_pct}% > maxBundlePct ${maxBundlePct}%`);
+        return false;
+      }
+      return true;
+    }));
     // Wash trading hard filter — fake volume = misleading fee yield
     eligible.splice(0, eligible.length, ...eligible.filter((p) => {
       if (p.is_wash) {

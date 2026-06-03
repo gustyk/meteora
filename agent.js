@@ -509,6 +509,29 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
         }
 
         await onToolStart?.({ name: functionName, args: functionArgs, step });
+
+        // Pre-enforce conviction: block deploy_position if the LLM's own
+        // conviction score is below the configured threshold. This converts
+        // the LOG-ONLY analytics check into a real gate.
+        if (functionName === "deploy_position") {
+          const minConviction = config.screening?.minConvictionScore ?? 7;
+          const lastAssistant = [...messages].reverse().find(m => m.role === "assistant" && m.content);
+          const conviction = extractConvictionScore(lastAssistant?.content || "");
+          if (conviction != null && conviction < minConviction) {
+            log("safety_block", `Conviction gate: ${conviction}/10 < ${minConviction} threshold — deploy blocked`);
+            const blockedResult = {
+              blocked: true,
+              reason: `Conviction score ${conviction}/10 is below the required threshold of ${minConviction}/10. Deploy blocked. Re-evaluate your conviction or choose a stronger candidate.`,
+            };
+            await onToolFinish?.({ name: functionName, args: functionArgs, result: blockedResult, success: false, step });
+            return {
+              role: "tool",
+              tool_call_id: toolCall.id,
+              content: JSON.stringify(blockedResult),
+            };
+          }
+        }
+
         const result = await executeTool(functionName, functionArgs);
         await onToolFinish?.({
           name: functionName,

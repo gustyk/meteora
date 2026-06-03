@@ -176,11 +176,29 @@ async function validateDeployPoolThresholds(args) {
   if (
     minFeeActiveTvlRatio != null &&
     minFeeActiveTvlRatio > 0 &&
-    (feeActiveTvlRatio == null || feeActiveTvlRatio < minFeeActiveTvlRatio)
+    feeActiveTvlRatio != null
+  ) {
+    // Risk-aware yield: scale required fee/active-TVL by pool volatility
+    // (consistent with screening.js getTopCandidates filter).
+    const vol = poolDetailVolatility(detail);
+    const volScale = Number.isFinite(vol) && vol > 0
+      ? Math.min(3.0, 1 + Math.max(0, vol - 1) * 0.2)
+      : 1.0;
+    const effectiveMinFee = Number((minFeeActiveTvlRatio * volScale).toFixed(4));
+    if (feeActiveTvlRatio < effectiveMinFee) {
+      return {
+        pass: false,
+        reason: `Pool fee/active-TVL ${feeActiveTvlRatio} is below vol-scaled minimum ${effectiveMinFee} (vol=${vol ?? "n/a"} × ${volScale.toFixed(2)} scale, base min=${minFeeActiveTvlRatio}).`,
+      };
+    }
+  } else if (
+    minFeeActiveTvlRatio != null &&
+    minFeeActiveTvlRatio > 0 &&
+    feeActiveTvlRatio == null
   ) {
     return {
       pass: false,
-      reason: `Pool fee/active-TVL ${feeActiveTvlRatio ?? "unknown"}% is below configured minFeeActiveTvlRatio ${minFeeActiveTvlRatio}%.`,
+      reason: `Pool fee/active-TVL unknown — cannot verify against minFeeActiveTvlRatio ${minFeeActiveTvlRatio}.`,
     };
   }
 
@@ -655,6 +673,7 @@ const toolMap = {
       gasReserve: ["management", "gasReserve"],
       positionSizePct: ["management", "positionSizePct"],
       minAgeBeforeYieldCheck: ["management", "minAgeBeforeYieldCheck"],
+      pollerTriggerCooldownSec: ["management", "pollerTriggerCooldownSec"],
       // Management Performance Layer (16-item overhaul)
       estCloseCostSol: ["management", "estCloseCostSol"],
       minCloseWorthinessSol: ["management", "minCloseWorthinessSol"],
