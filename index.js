@@ -599,10 +599,14 @@ export async function runManagementCycle({ silent = false } = {}) {
       await liveMessage?.note("No tool actions needed.");
     }
 
-    // Trigger screening after management
+    // Trigger screening after management — but only if no screener is already running
+    // and the cooldown has elapsed. This prevents double-deploys when a manual `auto`
+    // command and the management cron overlap.
     const afterPositions = await getMyPositions({ force: true }).catch(() => null);
     const afterCount = afterPositions?.positions?.length ?? 0;
-    if (afterCount < config.risk.maxPositions && Date.now() - _screeningLastTriggered > screeningCooldownMs) {
+    if (_screeningBusy) {
+      log("cron", "Post-management: skipping screening — screener already busy");
+    } else if (afterCount < config.risk.maxPositions && Date.now() - _screeningLastTriggered > screeningCooldownMs) {
       log("cron", `Post-management: ${afterCount}/${config.risk.maxPositions} positions — triggering screening`);
       runScreeningCycle().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
     }
@@ -2185,17 +2189,30 @@ Commands:
 
     // ── auto: agent picks and deploys ───────
     if (input.toLowerCase() === "auto") {
-      await runBusy(async () => {
-        console.log("\nAgent is picking and deploying...\n");
-        const { content: reply } = await agentLoop(
-          `get_top_candidates and deploy only if a candidate is clearly worth it. If there is only one weak candidate, report NO DEPLOY. For a valid deploy, use amount_y=${DEPLOY}, amount_x=0, bins_above=0, and bins_below from positive volatility. Execute now, don't ask.`,
-          config.llm.maxSteps,
-          [],
-          "SCREENER"
-        );
-        console.log(`\n${reply}\n`);
-        launchCron();
-      });
+      // Reuse the same busy lock + cooldown as the cron-triggered screener
+      // so the management cycle can't double-trigger a parallel run.
+      if (_screeningBusy) {
+        console.log("\nScreening already in progress — try again in a moment.\n");
+        rl.prompt();
+        return;
+      }
+      _screeningBusy = true;
+      _screeningLastTriggered = Date.now();
+      try {
+        await runBusy(async () => {
+          console.log("\nAgent is picking and deploying...\n");
+          const { content: reply } = await agentLoop(
+            `get_top_candidates and deploy only if a candidate is clearly worth it. If there is only one weak candidate, report NO DEPLOY. For a valid deploy, use amount_y=${DEPLOY}, amount_x=0, bins_above=0, and bins_below from positive volatility. Execute now, don't ask.`,
+            config.llm.maxSteps,
+            [],
+            "SCREENER"
+          );
+          console.log(`\n${reply}\n`);
+          launchCron();
+        });
+      } finally {
+        _screeningBusy = false;
+      }
       return;
     }
 

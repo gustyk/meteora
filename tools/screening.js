@@ -703,6 +703,7 @@ export async function getTopCandidates({ limit = 10 } = {}) {
   // Enrich with OKX data — advanced info (risk/bundle/sniper) + ATH price (no API key required)
   if (eligible.length > 0) {
     const { getAdvancedInfo, getPriceInfo, getClusterList, getRiskFlags } = await import("./okx.js");
+    const okxUnavailable = { adv: 0, price: 0, clusters: 0, risk: 0 };
     const okxResults = await Promise.allSettled(
       eligible.map(async (p) => {
         if (!p.base?.mint) return { adv: null, price: null, clusters: [], risk: null };
@@ -713,11 +714,10 @@ export async function getTopCandidates({ limit = 10 } = {}) {
           getRiskFlags(p.base.mint),
         ]);
 
-        const mintShort = p.base.mint.slice(0, 8);
-        if (adv.status !== "fulfilled")      log("okx", `advanced-info unavailable for ${p.name} (${mintShort})`);
-        if (price.status !== "fulfilled")    log("okx", `price-info unavailable for ${p.name} (${mintShort})`);
-        if (clusters.status !== "fulfilled") log("okx", `cluster-list unavailable for ${p.name} (${mintShort})`);
-        if (risk.status !== "fulfilled")     log("okx", `risk-check unavailable for ${p.name} (${mintShort})`);
+        if (adv.status !== "fulfilled")      okxUnavailable.adv++;
+        if (price.status !== "fulfilled")    okxUnavailable.price++;
+        if (clusters.status !== "fulfilled") okxUnavailable.clusters++;
+        if (risk.status !== "fulfilled")     okxUnavailable.risk++;
 
         return {
           adv: adv.status === "fulfilled" ? adv.value : null,
@@ -727,6 +727,11 @@ export async function getTopCandidates({ limit = 10 } = {}) {
         };
       })
     );
+    // One summary line per cycle instead of 4×N spam
+    const totalUnavail = okxUnavailable.adv + okxUnavailable.price + okxUnavailable.clusters + okxUnavailable.risk;
+    if (totalUnavail > 0) {
+      log("okx", `enrichment unavailable: adv=${okxUnavailable.adv}/${eligible.length} price=${okxUnavailable.price}/${eligible.length} clusters=${okxUnavailable.clusters}/${eligible.length} risk=${okxUnavailable.risk}/${eligible.length}`);
+    }
     for (let i = 0; i < eligible.length; i++) {
       const r = okxResults[i];
       if (r.status !== "fulfilled") continue;
@@ -840,6 +845,7 @@ export async function getTopCandidates({ limit = 10 } = {}) {
   return {
     candidates: eligible,
     total_screened: pools.length,
+    total_eligible: eligible.length,
     filtered_examples: filteredOut.slice(0, 3),
   };
 }

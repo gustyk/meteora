@@ -171,7 +171,7 @@ WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
           },
           bins_below: {
             type: "number",
-            description: "Number of bins below the current active bin. For single-side SOL deploys, this is the main range input: lower bin = active bin - bins_below, upper bin = active bin."
+            description: "Number of bins below the current active bin. For single-side SOL deploys, this is the main range input: lower bin = active bin - bins_below, upper bin = active bin. COMPUTE THIS EXACTLY: round(config.strategy.minBinsBelow + (volatility/5) * (config.strategy.maxBinsBelow - config.strategy.minBinsBelow)), then clamp to [minBinsBelow, maxBinsBelow]. Do not invent your own value — use the formula. If volatility is 0/null, refuse the deploy."
           },
           bins_above: {
             type: "number",

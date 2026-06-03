@@ -261,6 +261,7 @@ export async function createLiveMessage(title, intro = "Starting...") {
     flushTimer: null,
     flushPromise: null,
     flushRequested: false,
+    lastSentText: null, // cache to skip no-op Telegram API calls (avoids 400 "message is not modified")
   };
 
   function render() {
@@ -275,12 +276,20 @@ export async function createLiveMessage(title, intro = "Starting...") {
     state.flushTimer = null;
     state.flushRequested = false;
     const text = render();
+    // Skip the API call entirely if the rendered text hasn't changed since
+    // the last successful send. Telegram returns HTTP 400 ("message is not
+    // modified") for identical edits, which spams the error log.
+    if (state.messageId && text === state.lastSentText) {
+      return;
+    }
     if (!state.messageId) {
       const sent = await sendMessage(text);
       state.messageId = sent?.result?.message_id ?? null;
+      if (state.messageId) state.lastSentText = text;
       return;
     }
     await editMessage(text, state.messageId);
+    state.lastSentText = text;
   }
 
   function scheduleFlush(delay = 300) {
