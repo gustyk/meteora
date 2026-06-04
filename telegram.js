@@ -493,6 +493,27 @@ export async function notifyOutOfRange({ pair, minutesOOR }) {
   );
 }
 
+export async function notifyModelFailure({ model, error, consecutiveFailures, lastSuccess }) {
+  const timeSinceSuccess = lastSuccess
+    ? `${Math.round((Date.now() - lastSuccess) / 60_000)}m ago`
+    : "never";
+  await sendHTML(
+    `🚨 <b>MODEL FAILURE</b>\n` +
+    `Model: <code>${model}</code>\n` +
+    `Error: ${error?.slice(0, 200) || "unknown"}\n` +
+    `Consecutive failures: ${consecutiveFailures}\n` +
+    `Last success: ${timeSinceSuccess}\n` +
+    `Agent will keep retrying. Check logs if persistent.`
+  );
+}
+
+export async function notifyAgentRestart({ reason }) {
+  await sendHTML(
+    `🔄 <b>Agent Restarted</b>\n` +
+    `Reason: ${reason || "PM2 auto-restart"}`
+  );
+}
+
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }

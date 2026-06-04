@@ -196,6 +196,11 @@ function isToolChoiceRequiredError(error) {
   return /tool_choice/i.test(message) && (/required/i.test(message) || /no endpoints found/i.test(message));
 }
 
+function isToolUseNotSupportedError(error) {
+  const message = String(error?.message || error?.error?.message || error || "");
+  return /no endpoints found that support tool use/i.test(message);
+}
+
 function isThinkingModeToolChoiceError(error) {
   const message = String(error?.message || error?.error?.message || error || "");
   return /thinking mode does not support/i.test(message) && /tool_choice/i.test(message);
@@ -313,6 +318,10 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
           if (!omitToolChoice) reqParams.tool_choice = toolChoice;
           response = await client.chat.completions.create(reqParams);
         } catch (error) {
+          if (isToolUseNotSupportedError(error)) {
+            log("error", `Model ${usedModel} does not support tool use — aborting cycle. Switch to a model that supports function calling.`);
+            throw new Error(`Model ${usedModel} does not support tool use. Switch to a model that supports function calling (e.g. poolside/laguna-m.1:free, openrouter/owl-alpha, meta-llama/llama-3.3-70b-instruct:free).`);
+          }
           if (providerMode === "system" && isSystemRoleError(error)) {
             providerMode = "user_embedded";
             messages = buildMessages(systemPrompt, sessionHistory, goal, providerMode);
@@ -381,12 +390,19 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
 
       // If the model didn't call any tools, it's done
       if (!msg.tool_calls || msg.tool_calls.length === 0) {
-        // Hermes sometimes returns null content — pop the empty message and retry once
+        // Hermes sometimes returns null content — pop the empty message and retry
         if (!msg.content) {
           messages.pop(); // remove the empty assistant message
-          log("agent", "Empty response, retrying...");
+          emptyStreak += 1;
+          log("agent", `Empty response, retrying... (${emptyStreak}/3)`);
+          if (emptyStreak >= 3) {
+            log("agent", `Aborting: 3 consecutive empty responses from model`);
+            log("agent_summary", `cycle ended: steps=${step + 1} malformed_json=${malformedJSONCount} same_tool_guard_fired=${maxSameToolGuardFired} abort=empty_streak`);
+            return { content: "Cycle aborted: model returned 3 consecutive empty responses. Try again next cycle.", userMessage: goal };
+          }
           continue;
         }
+        emptyStreak = 0; // reset on non-empty response
         if (mustUseRealTool && !sawToolCall) {
           noToolRetryCount += 1;
           messages.pop();

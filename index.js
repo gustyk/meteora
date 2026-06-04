@@ -22,6 +22,8 @@ import {
   editMessageWithButtons,
   answerCallbackQuery,
   notifyOutOfRange,
+  notifyModelFailure,
+  notifyAgentRestart,
   isEnabled as telegramEnabled,
   createLiveMessage,
 } from "./telegram.js";
@@ -115,6 +117,12 @@ let _screeningLastTriggered = 0; // epoch ms — prevents management from spammi
 let _pollTriggeredAt = 0; // epoch ms — cooldown for poller-triggered management
 const _peakConfirmTimers = new Map();
 const _trailingDropConfirmTimers = new Map();
+// Model health tracking — consecutive failures trigger Telegram alert
+let _consecutiveScreeningFailures = 0;
+let _consecutiveManagementFailures = 0;
+let _lastSuccessfulScreening = 0;
+let _lastSuccessfulManagement = 0;
+const MODEL_FAILURE_ALERT_THRESHOLD = 3; // alert after 3 consecutive failures
 const TRAILING_PEAK_CONFIRM_DELAY_MS = 15_000;
 const TRAILING_PEAK_CONFIRM_TOLERANCE = 0.85;
 const TRAILING_DROP_CONFIRM_DELAY_MS = 15_000;
@@ -613,8 +621,23 @@ export async function runManagementCycle({ silent = false } = {}) {
   } catch (error) {
     log("cron_error", `Management cycle failed: ${error.message}`);
     mgmtReport = `Management cycle failed: ${error.message}`;
+    // Health tracking — alert on consecutive failures
+    _consecutiveManagementFailures++;
+    if (_consecutiveManagementFailures >= MODEL_FAILURE_ALERT_THRESHOLD) {
+      notifyModelFailure({
+        model: config.llm.managementModel,
+        error: error.message,
+        consecutiveFailures: _consecutiveManagementFailures,
+        lastSuccess: _lastSuccessfulManagement || null,
+      }).catch(() => {});
+    }
   } finally {
     _managementBusy = false;
+    // Reset failure counter on successful completion
+    if (!mgmtReport?.startsWith("Management cycle failed")) {
+      _consecutiveManagementFailures = 0;
+      _lastSuccessfulManagement = Date.now();
+    }
     if (!silent && telegramEnabled()) {
       if (mgmtReport) {
         if (liveMessage) await liveMessage.finalize(stripThink(mgmtReport)).catch(() => {});
@@ -1070,8 +1093,24 @@ ${candidateBlocks.join("\n\n")}
   } catch (error) {
     log("cron_error", `Screening cycle failed: ${error.message}`);
     screenReport = `Screening cycle failed: ${error.message}`;
+    // Health tracking — alert on consecutive failures
+    _consecutiveScreeningFailures++;
+    _consecutiveManagementFailures = 0; // reset other counter
+    if (_consecutiveScreeningFailures >= MODEL_FAILURE_ALERT_THRESHOLD) {
+      notifyModelFailure({
+        model: config.llm.screeningModel,
+        error: error.message,
+        consecutiveFailures: _consecutiveScreeningFailures,
+        lastSuccess: _lastSuccessfulScreening || null,
+      }).catch(() => {});
+    }
   } finally {
     _screeningBusy = false;
+    // Reset failure counter on successful completion (no throw)
+    if (!screenReport?.startsWith("Screening cycle failed")) {
+      _consecutiveScreeningFailures = 0;
+      _lastSuccessfulScreening = Date.now();
+    }
     if (!silent && telegramEnabled()) {
       if (screenReport) {
         if (liveMessage) await liveMessage.finalize(stripThink(screenReport)).catch(() => {});
@@ -2145,6 +2184,12 @@ if (isMain && isTTY) {
   // Always start autonomous cycles on launch
   launchCron();
   maybeRunMissedBriefing().catch(() => { });
+
+  // Notify Telegram on restart (PM2 auto-restart or manual)
+  if (telegramEnabled()) {
+    const restartReason = process.env.pm_id ? "PM2 auto-restart" : "manual start";
+    notifyAgentRestart({ reason: restartReason }).catch(() => {});
+  }
 
   startPolling(telegramHandler);
 
